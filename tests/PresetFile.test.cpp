@@ -153,6 +153,98 @@ int main()
 		Expect(bare.error.empty() && bare.presets.size() == 1 && bare.presets.front().angles.empty(), "an empty preset round-trips");
 	}
 
+	// Situations.
+	{
+		namespace PR = SD::Camera::PresetRules;
+
+		const auto file = PF::Read(
+			"{ \"name\": \"Inn at night\", \"use\": \"Close\", \"priority\": 2,\n"
+			"  \"when\": { \"location\": [\"Tavern\", \"Whiterun\"], \"time\": [\"night\", \"12:30-13\"], \"inside\": true,\n"
+			"            \"who\": \"Merchants\", \"weather\": \"rainy\", \"conversation\": \"yours\", \"chance\": 40 },\n"
+			"  \"unless\": { \"npc\": [\"Skyrim.esm|A2C94\", \"0x0A2C8E~Skyrim.esm\"] } }",
+			kWords);
+		Expect(file.error.empty() && file.presets.size() == 1, "a preset with conditions reads");
+		const auto& preset = file.presets.front();
+		Expect(preset.warnings.empty(), "valid conditions aren't reported");
+		Expect(preset.use == "Close" && preset.priority == 2, "use and priority read");
+		Expect(preset.when && preset.unless, "both blocks read");
+		const auto& when = *preset.when;
+		Expect(when.who == std::vector<std::string>{ "merchant" }, "kinds of people are stored by their first spelling");
+		Expect(when.weather == std::vector<std::string>{ "rain" }, "weather too");
+		Expect(when.time.size() == 2 && when.inside == true && when.overheard == false && when.chance == 40, "the rest read");
+		Expect(when.Count() == 6, "chance isn't a condition");
+
+		PR::Situation inn;
+		inn.inside = true;
+		inn.hour = 23.5f;
+		inn.who = { "merchant", "innkeeper" };
+		inn.weather = { "rain" };
+		inn.location.names = { "The Bannered Mare", "Whiterun", "Whiterun Hold" };
+		inn.locationKeywords = { "LocTypeInn", "LocTypeCity" };
+		inn.npc.names = { "Hulda" };
+		inn.npc.forms = { { "skyrim.esm", 0x13BA3, false } };
+		Expect(PR::Holds(when, inn), "everything holds");
+		Expect(!PR::Holds(*preset.unless, inn), "someone else isn't excepted");
+
+		auto lydia = inn;
+		lydia.npc.forms = { { "skyrim.esm", 0xA2C94, false } };
+		Expect(PR::Holds(*preset.unless, lydia), "a form matches whatever load order byte was copied");
+
+		auto noon = inn;
+		noon.hour = 12.75f;
+		Expect(PR::Holds(when, noon), "hour ranges hold");
+		noon.hour = 13.0f;
+		Expect(!PR::Holds(when, noon), "and end where they say");
+		auto early = inn;
+		early.hour = 3.0f;
+		Expect(PR::Holds(when, early), "night runs past midnight");
+
+		auto outside = inn;
+		outside.inside = false;
+		Expect(!PR::Holds(when, outside), "inside is a condition");
+		auto dry = inn;
+		dry.weather.clear();
+		Expect(!PR::Holds(when, dry), "no weather matches indoors");
+		auto city = inn;
+		city.location.names = { "Riften" };
+		city.locationKeywords = { "LocTypeCity" };
+		Expect(!PR::Holds(when, city), "a kind of place is matched by its keywords");
+		city.location.names = { "Whiterun" };
+		Expect(PR::Holds(when, city), "and a location by name, anywhere in its chain");
+
+		PR::Situation anyone;
+		Expect(PR::Holds(PR::Rules{}, anyone), "an empty block always holds");
+
+		const auto again = PF::Read(PF::Write(preset, kWords), kWords);
+		Expect(again.error.empty() && again.presets.size() == 1 && again.presets.front().warnings.empty(),
+			"conditions are written back readably");
+		Expect(again.presets.front().when == preset.when && again.presets.front().unless == preset.unless &&
+				   again.presets.front().priority == 2 && again.presets.front().use == "Close",
+			"and survive the round trip");
+
+		const auto summary = PR::Describe(when, [](std::string_view) { return std::string{}; });
+		Expect(summary == "indoors, Tavern or Whiterun, night or 12:30-13, rain, merchant, your conversations, 40% of the time",
+			"blocks describe themselves");
+		Expect(PR::Describe(*preset.unless, [](std::string_view a_form) {
+			return a_form == "Skyrim.esm|A2C94" ? std::string{ "Lydia" } : std::string{};
+		}) == "Lydia or 0x0A2C8E~Skyrim.esm", "forms are named where the game knows them");
+
+		const auto bad = PF::Read(
+			"{ \"when\": { \"who\": [\"dragon\", 3], \"time\": \"teatime\", \"weather\": \"fog\", \"mood\": 1,\n"
+			"              \"inside\": \"yes\", \"conversation\": \"loud\" }, \"unless\": 4, \"priority\": \"high\" }",
+			kWords);
+		Expect(bad.error.empty() && bad.presets.size() == 1, "bad conditions don't stop the file");
+		Expect(bad.presets.front().warnings.size() == 10, "each bad condition is reported once, and what it means");
+		Expect(!bad.presets.front().when, "a block of nothing but mistakes doesn't become always");
+		Expect(PF::Read("{ \"when\": {} }", kWords).presets.front().when.has_value(), "but an empty block does");
+		Expect(!bad.presets.front().unless, "a block that isn't one is dropped");
+
+		Expect(!PR::ParseForm("Lydia"), "a name isn't a form");
+		Expect(!PR::ParseForm("Skyrim|A2C94"), "a form names a plugin file");
+		Expect(!PR::ParseForm("Skyrim.esm|xyz"), "with a hex ID");
+		Expect(PR::SameForm(*PR::ParseForm("Mod.esl|FE001801"), { "mod.esl", 0x801, true }), "light plugins use 12 bits");
+	}
+
 	// Names.
 	Expect(PF::Lookup(kWords.effects, "LOCKED OFF") == 0, "lookups ignore case and spaces");
 	Expect(PF::Lookup(kWords.effects, "Push") == -1, "but not partial names");

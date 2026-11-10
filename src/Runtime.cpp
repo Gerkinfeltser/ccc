@@ -15,15 +15,18 @@
 #include "SD/Dialogue/MenuWatch.h"
 #include "SD/Dialogue/SceneWatch.h"
 #include "SD/Dialogue/Session.h"
+#include "SD/Dialogue/SubtitleTap.h"
 #include "SD/Menu/Settings.h"
 #include "SD/Render/Letterbox.h"
 #include "SD/Scene/FaceGen.h"
 #include "SD/Scene/KeepPosed.h"
 #include "SD/Scene/LightRig.h"
 #include "SD/Scene/LipSync.h"
+#include "SD/Scene/OverlaySignal.h"
 #include "SD/Scene/Performance.h"
 #include "SD/Scene/RegionalFace.h"
 #include "SD/Scene/Interface.h"
+#include "SD/Scene/WatchCue.h"
 
 #include <chrono>
 
@@ -115,6 +118,14 @@ namespace SD::Runtime
 		Dialogue::LineWatch::Install();
 		Dialogue::MenuWatch::Register();
 
+		// Other people's lines with subtitles off; SceneWatch reads the engine's
+		// subtitle list otherwise.
+		Dialogue::SubtitleTap::Install();
+
+		// After every plugin is loaded, so a Photo Mode global is found rather than
+		// doubled.
+		Scene::OverlaySignal::Prepare();
+
 		// Dialogue input belongs to the game: there's no input handler here. The topic
 		// list fade is visual only, and a click during a fade does what it does in
 		// vanilla.
@@ -147,6 +158,10 @@ namespace SD::Runtime
 
 		// Safe when the framework is missing; it checks for the DLL and returns.
 		Menu::Settings::Register();
+
+		// Same framework, same condition: it draws the sign that a conversation
+		// nearby can be watched.
+		Scene::WatchCue::Register();
 
 		// Always installed; bLetterbox is a live setting. A retracted letterbox costs
 		// one atomic read per frame.
@@ -356,6 +371,11 @@ namespace SD::Runtime
 		Dialogue::Session::GetSingleton().Abandon();
 		firstFrame.Reset();
 		Log::Info(Log::Category::kCore, "Game loaded; session state re-keyed. {} ticks so far."sv, FrameCount());
+	}
+
+	void BeforeSave()
+	{
+		Scene::OverlaySignal::BeforeSave();
 	}
 
 	void AbandonForLoad()

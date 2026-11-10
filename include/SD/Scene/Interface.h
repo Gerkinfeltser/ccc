@@ -30,9 +30,17 @@ namespace SD::Scene
 		static void ReleaseChoices();
 
 		// Re-apply what Suppress() hid, every staged frame. The engine and HUD mods
-		// rewrite _visible on their own schedule, and menus that open mid-conversation
-		// weren't there for the first sweep. Newcomers are swept on a timer.
+		// rewrite _visible and _alpha on their own schedule, and menus that open
+		// mid-conversation weren't there for the first sweep. Newcomers are swept on a
+		// timer.
 		static void Enforce();
+
+		// The same hold again, from the HUD's draw call. Most rewrites land after the
+		// game update (UI tasks, menu messages, the movies' own frame scripts), so a
+		// hold applied only in the update loses the frame they land on: a widget or the
+		// compass blinks on. Called every frame from Render::Letterbox's hook; does
+		// nothing unless the interface is held, or off the game's main thread.
+		static void HoldBeforeDraw();
 
 		// Fades the topic list out once a choice is made and back in for the next one.
 		// Only the topic holder is touched; DialogueMenu's subtitles stay.

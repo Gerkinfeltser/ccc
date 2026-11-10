@@ -1,6 +1,7 @@
 #include "SD/Render/Letterbox.h"
 
 #include "SD/Core/Logging.h"
+#include "SD/Scene/Interface.h"
 
 #include <chrono>
 
@@ -437,12 +438,20 @@ float4 PSMain(VSOut i) : SV_TARGET { return float4(0.0f, 0.0f, 0.0f, 1.0f); }
 		}
 
 		// IMenu::PostDisplay, which draws the menu's movie. One instantiation per menu
-		// so each keeps its own original.
+		// so each keeps its own original. The HUD's also re-applies the interface hold
+		// right before the movie draws, whether or not any bars are up.
 		template <std::size_t Slot>
 		struct PostDisplayHook
 		{
 			static void thunk(RE::IMenu* a_menu)
 			{
+				if constexpr (Slot == 0) {
+					try {
+						Scene::Interface::HoldBeforeDraw();
+					} catch (...) {
+					}
+				}
+
 				constexpr auto mine = Slot == 0 ? Letterbox::Beneath::kHud : Letterbox::Beneath::kDialogue;
 				if (beneath.load(std::memory_order_acquire) == mine && enabled.load(std::memory_order_acquire)) {
 					if constexpr (Slot == 1) {

@@ -175,9 +175,45 @@ namespace SD::Camera
 		// an exchange in front of them for sceneWait. Moving hands the camera back.
 		// [Direction] bFilmScenesAuto, iSceneRange (world units, to the nearer of the
 		// two), iSceneWait (hundredths).
-		bool sceneAuto{ false };
+		bool sceneAuto{ true };
 		int  sceneRange{ 600 };
 		int  sceneWait{ 150 };
+
+		// While that mode is on, a camera-in-a-ring sign shows when there is a
+		// conversation to watch, and the ring fills over sceneWait as the player
+		// stands still. See Scene::WatchCue. [Direction] bWatchSign.
+		bool watchSign{ true };
+
+		// In a filmed scene, a shot that wouldn't hold where its subject is about to
+		// move gets a still frame that does: chosen at the cut, as close as the
+		// movement allows, and then neither the camera nor its aim moves. Where they
+		// move comes from the last few seconds, the scene's next move for them, their
+		// AI package and how they're already moving. The forecast is logged with this
+		// off. [Direction] bFitShotsToMovement.
+		bool fitShotsToMovement{ false };
+
+		// In a filmed scene, two people standing together now and then get one shot of
+		// both of them, held across a couple of lines of their exchange instead of
+		// cutting to each speaker. Rolled when the speaker changes. [Direction]
+		// bTogetherShot, iTogetherChance (percent), iTogetherLines (the most lines held;
+		// at least two), iTogetherReach (how close counts as together, world units).
+		bool twoShotHold{ true };
+		int  twoShotChance{ 35 };
+		int  twoShotLines{ 3 };
+		int  twoShotReach{ 220 };
+
+		// The player turns to face whoever they're talking to when the conversation
+		// starts, and again if that person ends up well off to one side. Not while
+		// seated, mounted or in furniture. [Performance] bTurnToFace.
+		bool turnToFace{ true };
+
+		// Voices play at full level from the middle of the screen however far away the
+		// camera is. See Scene::CloseMic. [Sound] bVoicesUpClose.
+		bool voicesUpClose{ true };
+
+		// Installed presets that say when to use them take over for those
+		// conversations. See Camera::Situational. [Presets] bSituational.
+		bool situationalPresets{ true };
 
 		// Diagnostic: how ApplyPose writes the camera transform (0 is normal). A
 		// tunable so the menu can change it between conversations. See ApplyPose.

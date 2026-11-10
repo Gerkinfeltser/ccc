@@ -14,7 +14,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
 	SceneDirector
-	VERSION 1.5.0
+	VERSION 1.5.5
 	LANGUAGES CXX
 )
 
@@ -129,9 +129,11 @@ if(SD_BUILD_TESTS)
 	add_executable(PersuasionBeatTests tests/PersuasionBeat.test.cpp)
 	add_executable(SceneTriggerTests tests/SceneTrigger.test.cpp)
 	add_executable(SceneScriptTests tests/SceneScript.test.cpp)
+	add_executable(TripodTests tests/Tripod.test.cpp)
 	add_executable(PresetFileTests tests/PresetFile.test.cpp)
+	add_executable(SubtitleCodeTests tests/SubtitleCode.test.cpp)
 	target_link_libraries(PresetFileTests PRIVATE nlohmann_json::nlohmann_json)
-	foreach(SD_TEST_TARGET IN ITEMS SightGeometryTests VisibilityRecoveryTests ShotSelectionTests ShotAnglesTests ExpressionModelTests BrowMotionTests UpperFaceTests RegionalGeometryTests DialogueDisplayOverrideTests DialoguePhaseTests PlayerVoiceHandoffTests FaceFrameTests ReactionShotsTests ListenerPerformanceTests ActingTests UpperFaceTestTests ExpressionProfilesTests SettingsCacheTests SubtitlePlacementTests PersuasionBeatTests SceneTriggerTests SceneScriptTests PresetFileTests)
+	foreach(SD_TEST_TARGET IN ITEMS SightGeometryTests VisibilityRecoveryTests ShotSelectionTests ShotAnglesTests ExpressionModelTests BrowMotionTests UpperFaceTests RegionalGeometryTests DialogueDisplayOverrideTests DialoguePhaseTests PlayerVoiceHandoffTests FaceFrameTests ReactionShotsTests ListenerPerformanceTests ActingTests UpperFaceTestTests ExpressionProfilesTests SettingsCacheTests SubtitlePlacementTests PersuasionBeatTests SceneTriggerTests SceneScriptTests TripodTests PresetFileTests SubtitleCodeTests)
 		target_include_directories(${SD_TEST_TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 		target_compile_features(${SD_TEST_TARGET} PRIVATE cxx_std_20)
 		if(MSVC)

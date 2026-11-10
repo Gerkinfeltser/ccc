@@ -2,6 +2,7 @@
 
 #include "SD/Core/Logging.h"
 #include "SD/Dialogue/SceneTrigger.h"
+#include "SD/Dialogue/SubtitleTap.h"
 
 #include <chrono>
 
@@ -56,7 +57,27 @@ namespace SD::Dialogue
 		constexpr std::size_t kMaxSubtitles = 16;
 		constexpr std::size_t kImplausibleSubtitles = 256;
 
+		// Lines the engine turned away with subtitles off (SubtitleTap), by speaker. Main
+		// thread only.
+		struct Asked
+		{
+			std::string       text{};
+			Clock::time_point at{};  // the last time the engine was asked for it
+		};
+		std::unordered_map<RE::FormID, Asked> asked;
+
+		// The engine may ask again for a line it refused. The same text from the same
+		// person this soon after is the same line.
+		constexpr float kSameLineSeconds = 1.0f;
+
+		// A refused line counts as still being said this long after the engine last
+		// asked for it. The voice and the line's estimated length cover the rest.
+		constexpr float kAskedTalkingSeconds = 0.5f;
+
+		constexpr float kAskedForgetSeconds = 30.0f;
+
 		Log::OnceFlag firstHeardReported;
+		Log::OnceFlag firstAskedReported;
 		Log::OnceFlag layoutReported;
 
 		// Is this line said to the player? Only the signals that mean addressed: the
@@ -177,6 +198,130 @@ namespace SD::Dialogue
 			position.z += kHeadHeight * a_actor->GetScale();
 			return position;
 		}
+
+		// A new line from someone other than the player: kept, logged and handed to the
+		// Director.
+		void Hear(RE::Actor* a_actor, const std::string& a_text, bool a_subtitlesOff, std::vector<HeardLine>& a_heard)
+		{
+			const auto  line = Record(a_actor);
+			const auto* scene = a_actor->GetCurrentScene();
+			const char* name = a_actor->GetName();
+
+			// The scene and its phase, which tells whether a line is story or filler (see
+			// SceneScript.h).
+			const std::string where = scene ?
+				fmt::format(" | in a scene ({:08X} phase {})", scene->GetFormID(),
+					static_cast<std::int32_t>(scene->currentPhaseIndex)) :
+				std::string{};
+			Log::Info(Log::Category::kDialogue, "Overheard | {} [{:08X}]{}{}{} | \"{}\""sv,
+				(name && *name) ? name : "<unnamed>", a_actor->GetFormID(),
+				line.toPlayer ? " | to you"sv : ""sv,
+				where,
+				a_subtitlesOff ? " | subtitles off"sv : ""sv,
+				a_text.size() > 90 ? a_text.substr(0, 90) + "..." : a_text);
+			a_heard.push_back(HeardLine{ a_actor->GetHandle(), a_text });
+		}
+
+		// Lines from the engine's subtitle list, with either subtitle setting on.
+		void ReadSubtitles(RE::PlayerCharacter* a_player, RE::TESObjectREFR* a_partner, std::vector<HeardLine>& a_heard)
+		{
+			auto* manager = RE::SubtitleManager::GetSingleton();
+			if (!manager) {
+				showing.clear();
+				return;
+			}
+
+			struct Entry
+			{
+				RE::ObjectRefHandle speaker{};
+				std::string         text{};
+			};
+			std::array<Entry, kMaxSubtitles> entries{};
+			std::size_t                      count = 0;
+			{
+				RE::BSSpinLockGuard guard{ manager->lock };
+				if (manager->subtitles.size() > kImplausibleSubtitles) {
+					if (layoutReported.Take()) {
+						Log::Warn(Log::Category::kDialogue,
+							"SubtitleManager reports {} subtitles; its layout does not match this build. "
+							"Other people's conversations can only be heard through the dialogue hook."sv,
+							manager->subtitles.size());
+					}
+					return;
+				}
+				for (const auto& info : manager->subtitles) {
+					if (count >= entries.size()) {
+						break;
+					}
+					const char* text = info.subtitle.c_str();
+					entries[count++] = Entry{ info.speaker, text ? std::string{ text } : std::string{} };
+				}
+			}
+
+			const auto                              clock = Clock::now();
+			std::unordered_map<RE::FormID, Showing> now;
+			for (std::size_t i = 0; i < count; ++i) {
+				auto& entry = entries[i];
+				auto  ref = entry.speaker.get();
+				auto* actor = ref ? ref->As<RE::Actor>() : nullptr;
+				if (!actor || actor == static_cast<RE::Actor*>(a_player) || entry.text.empty()) {
+					continue;
+				}
+
+				const auto id = actor->GetFormID();
+				const auto previous = showing.find(id);
+				const bool fresh = previous == showing.end() || previous->second.text != entry.text;
+
+				// Combat barks aren't conversation; skip anyone fighting.
+				const bool counted = ref.get() != a_partner && !actor->IsInCombat();
+
+				Showing shown = fresh ? Showing{ std::move(entry.text), clock, counted } : std::move(previous->second);
+				if (fresh && counted) {
+					if (firstHeardReported.Take()) {
+						Log::Info(Log::Category::kDialogue,
+							"Hearing other people's lines through the engine's subtitles."sv);
+					}
+					Hear(actor, shown.text, false, a_heard);
+				}
+				now[id] = std::move(shown);
+			}
+
+			showing = std::move(now);
+		}
+
+		// Lines the engine turned away because both subtitle settings are off.
+		void ReadRefused(RE::PlayerCharacter* a_player, RE::TESObjectREFR* a_partner, std::vector<HeardLine>& a_heard)
+		{
+			for (auto& line : SubtitleTap::Take()) {
+				auto* actor = RE::TESForm::LookupByID<RE::Actor>(line.speaker);
+				if (!actor || actor == static_cast<RE::Actor*>(a_player) || line.text.empty()) {
+					continue;
+				}
+
+				auto&      seen = asked[line.speaker];
+				const bool fresh = seen.text != line.text || SecondsSince(seen.at, line.at) > kSameLineSeconds;
+				seen.at = line.at;
+				if (!fresh) {
+					continue;
+				}
+				seen.text = std::move(line.text);
+
+				if (actor == a_partner || actor->IsInCombat()) {
+					continue;
+				}
+				if (firstAskedReported.Take()) {
+					Log::Info(Log::Category::kDialogue,
+						"Subtitles are off in the game's settings; hearing other people's lines as the game "
+						"starts them instead."sv);
+				}
+				Hear(actor, seen.text, true, a_heard);
+			}
+
+			const auto clock = Clock::now();
+			std::erase_if(asked, [&](const auto& a_entry) {
+				return SecondsSince(a_entry.second.at, clock) > kAskedForgetSeconds;
+			});
+		}
 	}
 
 	void SceneWatch::OnLine(RE::Actor* a_speaker, const RE::DialogueResponse* a_response)
@@ -195,38 +340,11 @@ namespace SD::Dialogue
 	{
 		std::vector<HeardLine> heard;
 
-		auto* manager = RE::SubtitleManager::GetSingleton();
 		auto* player = RE::PlayerCharacter::GetSingleton();
-		if (!manager || !player) {
+		if (!player) {
 			showing.clear();
+			asked.clear();
 			return heard;
-		}
-
-		struct Entry
-		{
-			RE::ObjectRefHandle speaker{};
-			std::string         text{};
-		};
-		std::array<Entry, kMaxSubtitles> entries{};
-		std::size_t                      count = 0;
-		{
-			RE::BSSpinLockGuard guard{ manager->lock };
-			if (manager->subtitles.size() > kImplausibleSubtitles) {
-				if (layoutReported.Take()) {
-					Log::Warn(Log::Category::kDialogue,
-						"SubtitleManager reports {} subtitles; its layout does not match this build. "
-						"Other people's conversations can only be heard through the dialogue hook."sv,
-						manager->subtitles.size());
-				}
-				return heard;
-			}
-			for (const auto& info : manager->subtitles) {
-				if (count >= entries.size()) {
-					break;
-				}
-				const char* text = info.subtitle.c_str();
-				entries[count++] = Entry{ info.speaker, text ? std::string{ text } : std::string{} };
-			}
 		}
 
 		// The player's own partner is their conversation (heard through the dialogue
@@ -236,55 +354,27 @@ namespace SD::Dialogue
 			partner = topics->speaker.get().get();
 		}
 
-		const auto                              clock = Clock::now();
-		std::unordered_map<RE::FormID, Showing> now;
-		for (std::size_t i = 0; i < count; ++i) {
-			auto& entry = entries[i];
-			auto  ref = entry.speaker.get();
-			auto* actor = ref ? ref->As<RE::Actor>() : nullptr;
-			if (!actor || actor == static_cast<RE::Actor*>(player) || entry.text.empty()) {
-				continue;
-			}
-
-			const auto id = actor->GetFormID();
-			const auto previous = showing.find(id);
-			const bool fresh = previous == showing.end() || previous->second.text != entry.text;
-
-			// Combat barks aren't conversation; skip anyone fighting.
-			const bool counted = ref.get() != partner && !actor->IsInCombat();
-
-			Showing shown = fresh ? Showing{ std::move(entry.text), clock, counted } : std::move(previous->second);
-			if (fresh && counted) {
-				const auto  line = Record(actor);
-				const auto* scene = actor->GetCurrentScene();
-				const char* name = actor->GetName();
-				if (firstHeardReported.Take()) {
-					Log::Info(Log::Category::kDialogue,
-						"Hearing other people's lines through the engine's subtitles."sv);
-				}
-				// The scene and its phase, which tells whether a line is story or filler (see
-				// SceneScript.h).
-				const std::string where = scene ?
-					fmt::format(" | in a scene ({:08X} phase {})", scene->GetFormID(),
-						static_cast<std::int32_t>(scene->currentPhaseIndex)) :
-					std::string{};
-				Log::Info(Log::Category::kDialogue, "Overheard | {} [{:08X}]{}{} | \"{}\""sv,
-					(name && *name) ? name : "<unnamed>", id,
-					line.toPlayer ? " | to you"sv : ""sv,
-					where,
-					shown.text.size() > 90 ? shown.text.substr(0, 90) + "..." : shown.text);
-				heard.push_back(HeardLine{ actor->GetHandle(), shown.text });
-			}
-			now[id] = std::move(shown);
-		}
-
-		showing = std::move(now);
+		ReadSubtitles(player, partner, heard);
+		ReadRefused(player, partner, heard);
 		return heard;
 	}
 
 	bool SceneWatch::Talking(const RE::Actor* a_actor)
 	{
-		return a_actor && showing.contains(a_actor->GetFormID());
+		if (!a_actor) {
+			return false;
+		}
+		const auto id = a_actor->GetFormID();
+		if (showing.contains(id)) {
+			return true;
+		}
+		const auto refused = asked.find(id);
+		return refused != asked.end() && SecondsSince(refused->second.at, Clock::now()) < kAskedTalkingSeconds;
+	}
+
+	bool SceneWatch::Deaf() noexcept
+	{
+		return SubtitleTap::SubtitlesOff() && !SubtitleTap::Installed();
 	}
 
 	RE::NiPointer<RE::Actor> SceneWatch::Listener(RE::Actor* a_speaker)
@@ -485,5 +575,7 @@ namespace SD::Dialogue
 		next = 0;
 		stored = 0;
 		showing.clear();
+		asked.clear();
+		static_cast<void>(SubtitleTap::Take());
 	}
 }

@@ -902,6 +902,17 @@ namespace SD::Camera
 			!spec.overShoulder && spec.fill >= 0.5f;
 	}
 
+	bool SameAxis(ShotType a_from, ShotType a_to) noexcept
+	{
+		if (a_from == a_to || !FollowsFace(a_from) || !FollowsFace(a_to)) {
+			return false;
+		}
+		const auto from = SpecFor(a_from);
+		const auto to = SpecFor(a_to);
+		return from.onNpc == to.onNpc && std::abs(from.angleDeg - to.angleDeg) < 20.0f &&
+		       std::abs(from.rise - to.rise) < 12.0f;
+	}
+
 	bool IsNeutral(ShotType a_type) noexcept
 	{
 		switch (a_type) {

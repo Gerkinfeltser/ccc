@@ -41,12 +41,18 @@ namespace SD::Dialogue
 
 		// Lines between NPCs don't reach UpdateInDialogue (it only fires for lines
 		// spoken to the player), but every subtitled line goes through the engine's
-		// SubtitleManager with its speaker. Polled every frame from the tick; returns
-		// the speakers whose subtitle text changed since the last call.
+		// SubtitleManager with its speaker. With subtitles off the engine keeps none,
+		// and the lines come from SubtitleTap instead. Polled every frame from the
+		// tick; returns the new lines since the last call.
 		[[nodiscard]] static std::vector<HeardLine> Poll();
 
-		// The actor's subtitle is on screen, as of the last Poll.
+		// The actor's subtitle is up, as of the last Poll. With subtitles off, only for
+		// a moment after their line starts.
 		[[nodiscard]] static bool Talking(const RE::Actor* a_actor);
+
+		// Subtitles are off and SubtitleTap couldn't be installed, so nobody else can
+		// be heard.
+		[[nodiscard]] static bool Deaf() noexcept;
 
 		// Who the engine says this NPC is talking to: their dialogue target, then
 		// where their head is turned. Null when neither names another actor.

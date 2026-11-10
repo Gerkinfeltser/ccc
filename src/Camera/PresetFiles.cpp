@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 
 namespace SD::Camera
 {
@@ -108,7 +109,49 @@ namespace SD::Camera
 			return look >= 0 ? look : Scene::DefaultLook();
 		}
 
-		[[nodiscard]] InstalledPreset Resolve(const PresetFile::Preset& a_source, const fs::path& a_path)
+		[[nodiscard]] bool SameText(std::string_view a_left, std::string_view a_right)
+		{
+			return PresetFile::Lower(a_left) == PresetFile::Lower(a_right);
+		}
+
+		// A built-in by its ini key or its menu name.
+		[[nodiscard]] const Preset* FindBuiltIn(std::string_view a_name)
+		{
+			for (const auto& preset : AllPresets()) {
+				if (PresetFile::Simplify(preset.key) == PresetFile::Simplify(a_name) ||
+					PresetFile::Simplify(preset.name) == PresetFile::Simplify(a_name)) {
+					return &preset;
+				}
+			}
+			return nullptr;
+		}
+
+		// A built-in in the same shape as an installed preset, to start from.
+		[[nodiscard]] InstalledPreset FromBuiltIn(const Preset& a_preset)
+		{
+			InstalledPreset out{};
+			out.name = a_preset.name;
+			out.style = a_preset.style;
+			for (std::size_t i = 0; i < out.shots.size(); ++i) {
+				const auto type = static_cast<ShotType>(i);
+				auto&      entry = out.shots[i];
+				entry.on = PresetUses(a_preset, type);
+				const auto motion = PresetMotion(a_preset, type);
+				entry.move = motion.move;
+				entry.amount = motion.amount;
+				entry.time = motion.time;
+				entry.lens = PresetLens(a_preset, type);
+				entry.weight = PresetWeight(a_preset, type);
+				const int look = Scene::FindLook(PresetLight(a_preset, type));
+				entry.light = look >= 0 ? look : Scene::DefaultLook();
+			}
+			out.usable = true;
+			return out;
+		}
+
+		// a_base is the preset the file starts from ("use"), or null.
+		[[nodiscard]] InstalledPreset Resolve(const PresetFile::Preset& a_source, const fs::path& a_path,
+			const InstalledPreset* a_base)
 		{
 			auto preset = Named(a_path);
 			if (!a_source.name.empty()) {
@@ -116,9 +159,13 @@ namespace SD::Camera
 			}
 			preset.author = a_source.author;
 			preset.description = a_source.description;
+			preset.when = a_source.when;
+			preset.unless = a_source.unless;
+			preset.priority = a_source.priority.value_or(0);
+			preset.use = a_source.use;
 
-			// Cutting left out of the file uses Close's.
-			const auto& base = DefaultPreset().style;
+			// Cutting left out of the file uses the preset it starts from, or Close's.
+			const auto& base = a_base ? a_base->style : DefaultPreset().style;
 			const auto& cut = a_source.cutting;
 			auto&       style = preset.style;
 			style.perLineAngleChange = cut.changeAnglePerLine.value_or(base.perLineAngleChange);
@@ -130,26 +177,52 @@ namespace SD::Camera
 			style.maxShotTime = std::clamp(cut.changeAfter.value_or(base.maxShotTime), 100, 2000);
 			style.minShotTime = std::clamp(cut.shortestHold.value_or(base.minShotTime), 30, 900);
 
+			// Starting from another preset, its angles stand unless the file lists its
+			// own, and a listed angle it already uses keeps that preset's tuning for
+			// anything the file leaves out.
+			if (a_base) {
+				preset.shots = a_base->shots;
+				if (!a_source.angles.empty()) {
+					for (auto& entry : preset.shots) {
+						entry.on = false;
+					}
+				}
+			}
+
 			for (const auto& angle : a_source.angles) {
 				if (angle.angle < 0 || angle.angle >= static_cast<int>(ShotType::kCount)) {
 					continue;
 				}
-				const auto type = static_cast<ShotType>(angle.angle);
-				auto&      entry = preset.shots[static_cast<std::size_t>(angle.angle)];
+				const auto  type = static_cast<ShotType>(angle.angle);
+				const auto  index = static_cast<std::size_t>(angle.angle);
+				const auto* inherited = a_base && a_base->shots[index].on ? &a_base->shots[index] : nullptr;
+				auto&       entry = preset.shots[index];
+
+				// Amount and duration mean nothing on a locked shot, so a locked one has
+				// none to pass on.
+				const bool inheritsMotion = inherited && inherited->move != Move::kLocked;
 
 				entry.on = true;
-				entry.move = angle.effect ? static_cast<Move>(*angle.effect) : Shot::AuthoredMove(type);
+				entry.move = angle.effect ? static_cast<Move>(*angle.effect) :
+				             inherited    ? inherited->move :
+				                            Shot::AuthoredMove(type);
 				if (entry.move == Move::kLocked) {
 					entry.amount = kInertAmount;
 					entry.time = kInertTime;
 				} else {
-					entry.amount = std::clamp(angle.amount.value_or(Shot::AuthoredMoveAmount(type)), 0, 100);
-					entry.time = std::clamp(angle.duration.value_or(Shot::AuthoredMoveTime(type)), 30, 900);
+					entry.amount = std::clamp(angle.amount.value_or(inheritsMotion ? inherited->amount :
+																					   Shot::AuthoredMoveAmount(type)),
+						0, 100);
+					entry.time = std::clamp(angle.duration.value_or(inheritsMotion ? inherited->time :
+																					   Shot::AuthoredMoveTime(type)),
+						30, 900);
 				}
-				entry.lens = std::clamp(angle.fov.value_or(static_cast<int>(std::lround(AuthoredLens(type)))),
+				entry.lens = std::clamp(angle.fov.value_or(inherited ? inherited->lens :
+																	   static_cast<int>(std::lround(AuthoredLens(type)))),
 					kMinLens, kMaxLens);
-				entry.weight = std::clamp(angle.frequency.value_or(AuthoredWeight(type)), 0, 100);
-				entry.light = angle.light ? *angle.light : AuthoredLook(type);
+				entry.weight = std::clamp(angle.frequency.value_or(inherited ? inherited->weight : AuthoredWeight(type)),
+					0, 100);
+				entry.light = angle.light ? *angle.light : inherited ? inherited->light : AuthoredLook(type);
 			}
 
 			for (const auto& entry : preset.shots) {
@@ -166,9 +239,16 @@ namespace SD::Camera
 			return preset;
 		}
 
-		// Reads one file into a_out: one entry per preset, or one unusable entry
-		// saying why the file can't be read.
-		void ReadFile(const fs::path& a_path, std::vector<InstalledPreset>& a_out)
+		struct Source
+		{
+			PresetFile::Preset preset;
+			fs::path           path;
+		};
+
+		// Reads one file: its presets go to a_sources to be resolved once every file
+		// is read, since one may start from another. A file that can't be read goes
+		// straight to a_out as one unusable entry saying why.
+		void ReadFile(const fs::path& a_path, std::vector<Source>& a_sources, std::vector<InstalledPreset>& a_out)
 		{
 			const auto      name = Log::Utf8(a_path.filename().wstring());
 			std::error_code ec;
@@ -202,7 +282,7 @@ namespace SD::Camera
 			}
 
 			for (const auto& preset : file.presets) {
-				a_out.push_back(Resolve(preset, a_path));
+				a_sources.push_back({ preset, a_path });
 			}
 
 			if (report) {
@@ -219,9 +299,65 @@ namespace SD::Camera
 			}
 		}
 
-		[[nodiscard]] bool SameText(std::string_view a_left, std::string_view a_right)
+		// Names of presets already reported as starting from one that isn't
+		// installed, so the rescan doesn't repeat it.
+		std::set<std::string> missingReported;
+
+		// Presets that start from another installed preset wait for it to resolve. A
+		// few rounds settle any chain; whatever is left names something that isn't
+		// installed, or itself.
+		void ResolveAll(const std::vector<Source>& a_sources, std::vector<InstalledPreset>& a_out)
 		{
-			return PresetFile::Lower(a_left) == PresetFile::Lower(a_right);
+			std::vector<bool> done(a_sources.size(), false);
+			for (int round = 0; round < 8; ++round) {
+				bool progress = false;
+				for (std::size_t i = 0; i < a_sources.size(); ++i) {
+					if (done[i]) {
+						continue;
+					}
+					const auto& source = a_sources[i];
+
+					std::optional<InstalledPreset> base;
+					if (!source.preset.use.empty()) {
+						if (const auto* builtIn = FindBuiltIn(source.preset.use)) {
+							base = FromBuiltIn(*builtIn);
+						} else {
+							const auto found = std::ranges::find_if(a_out, [&source](const InstalledPreset& a_preset) {
+								return a_preset.usable && (SameText(a_preset.name, source.preset.use) ||
+															  SameText(a_preset.stem, source.preset.use));
+							});
+							if (found == a_out.end()) {
+								continue;
+							}
+							base = *found;
+						}
+					}
+
+					a_out.push_back(Resolve(source.preset, source.path, base ? &*base : nullptr));
+					done[i] = true;
+					progress = true;
+				}
+				if (!progress) {
+					break;
+				}
+			}
+
+			for (std::size_t i = 0; i < a_sources.size(); ++i) {
+				if (done[i]) {
+					continue;
+				}
+				const auto& source = a_sources[i];
+				auto        broken = Named(source.path);
+				if (!source.preset.name.empty()) {
+					broken.name = source.preset.name;
+				}
+				broken.problem = "Starts from \"" + source.preset.use + "\", which isn't a built-in or installed preset.";
+				if (missingReported.insert(broken.file + "|" + broken.name).second) {
+					Log::Warn(Log::Category::kCamera, "Preset file {}, '{}': {}"sv, broken.file, broken.name,
+						broken.problem);
+				}
+				a_out.push_back(std::move(broken));
+			}
 		}
 	}
 
@@ -240,6 +376,7 @@ namespace SD::Camera
 		lastScan = now;
 
 		std::vector<InstalledPreset> found;
+		std::vector<Source>          sources;
 		std::size_t                  files = 0;
 		const auto                   folder = PresetFolder();
 		std::error_code              ec;
@@ -252,9 +389,10 @@ namespace SD::Camera
 					continue;
 				}
 				++files;
-				ReadFile(item.path(), found);
+				ReadFile(item.path(), sources, found);
 			}
 		}
+		ResolveAll(sources, found);
 
 		std::stable_sort(found.begin(), found.end(), [](const InstalledPreset& a_left, const InstalledPreset& a_right) {
 			return PresetFile::Lower(a_left.name) < PresetFile::Lower(a_right.name);
@@ -402,7 +540,8 @@ namespace SD::Camera
 		return false;
 	}
 
-	ExportResult ExportPreset(std::string_view a_name, std::string_view a_author, std::string_view a_description)
+	ExportResult ExportPreset(std::string_view a_name, std::string_view a_author, std::string_view a_description,
+		const PresetRules::Rules* a_when)
 	{
 		ExportResult result{};
 
@@ -427,6 +566,9 @@ namespace SD::Camera
 		preset.name = name.empty() ? stem : name;
 		preset.author = PresetFile::OneLine(a_author);
 		preset.description = PresetFile::OneLine(a_description);
+		if (a_when && !a_when->Empty()) {
+			preset.when = *a_when;
+		}
 
 		const auto live = Director::GetTunables();
 		auto&      cut = preset.cutting;

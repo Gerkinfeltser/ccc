@@ -387,6 +387,11 @@ namespace SD::Camera
 	// excluded, since turning them would lose the shoulder.
 	[[nodiscard]] bool FollowsFace(ShotType a_type) noexcept;
 
+	// Two close singles of the same side taken from nearly the same place, like the
+	// close-up and the extreme close-up. Cutting from one to the other on the same
+	// person only changes the size: a jump cut.
+	[[nodiscard]] bool SameAxis(ShotType a_from, ShotType a_to) noexcept;
+
 	// Solves a camera pose. Distance comes from how much of the frame the subject
 	// should fill, not from how far apart the two people stand.
 	//

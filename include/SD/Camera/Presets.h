@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SD/Camera/PresetRules.h"
 #include "SD/Camera/Shot.h"
 
 namespace SD::Camera
@@ -176,8 +177,9 @@ namespace SD::Camera
 	// can be shared and installed as their own mods. A file holds one preset or a
 	// list of them; the format is described in PresetFile.h and USAGE.md. Angles
 	// a preset lists are on and every other angle is off; anything else it leaves
-	// out uses the angle's own default, or Close's cutting. Menu thread and
-	// startup only.
+	// out uses the angle's own default, or Close's cutting. A preset that starts
+	// from another ("use") takes that one's settings instead. Main thread only;
+	// the menu draws there too.
 	struct InstalledPreset
 	{
 		struct Entry
@@ -207,6 +209,13 @@ namespace SD::Camera
 		Style                                                         style{};
 		std::array<Entry, static_cast<std::size_t>(ShotType::kCount)> shots{};
 		int                                                           shotsOn{ 0 };
+
+		// When it's used by itself (see PresetRules.h and Situational.h). Without a
+		// "when" it's only ever applied from the menu.
+		std::optional<PresetRules::Rules> when;
+		std::optional<PresetRules::Rules> unless;
+		int                               priority{ 0 };
+		std::string                       use;  // the preset it started from, as the file names it
 	};
 
 	// The folder preset files are read from and exported to.
@@ -240,7 +249,8 @@ namespace SD::Camera
 	[[nodiscard]] bool ExportReplaces(std::string_view a_name);
 
 	// Saves the current settings as <name>.json in PresetFolder(), replacing a
-	// file of the same name.
+	// file of the same name. With a_when, the preset is also used by itself in
+	// those situations.
 	[[nodiscard]] ExportResult ExportPreset(std::string_view a_name, std::string_view a_author,
-		std::string_view a_description);
+		std::string_view a_description, const PresetRules::Rules* a_when = nullptr);
 }

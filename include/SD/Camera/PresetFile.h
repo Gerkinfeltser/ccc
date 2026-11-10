@@ -10,6 +10,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "SD/Camera/PresetRules.h"
+
 namespace SD::Camera::PresetFile
 {
 	// Reading and writing preset files (SKSE/Plugins/SceneDirector/Presets/*.json).
@@ -32,6 +34,15 @@ namespace SD::Camera::PresetFile
 	// The angles listed are the ones in use; every other angle is off. Anything
 	// else left out is filled in by the caller. Names are matched ignoring case,
 	// spaces, dashes and underscores, and // comments are allowed.
+	//
+	// Optional, beside those:
+	//
+	//   "use": "Close"                  start from another preset, built-in or
+	//                                   installed; "cutting" and "angles" then
+	//                                   only change what they list
+	//   "when": { ... }, "unless": { ... }, "priority": 1
+	//                                   use it by itself in these situations
+	//                                   (see PresetRules.h)
 
 	// Each entry is one thing under every name it may be written as. The first
 	// name is the one written out.
@@ -80,6 +91,11 @@ namespace SD::Camera::PresetFile
 		Cutting                  cutting;
 		std::vector<Angle>       angles;    // the angles in use, in file order
 		std::vector<std::string> warnings;  // parts of this preset that were skipped
+
+		std::string                        use;  // the preset this one starts from, if any
+		std::optional<PresetRules::Rules> when;
+		std::optional<PresetRules::Rules> unless;
+		std::optional<int>                 priority;
 	};
 
 	struct File
@@ -89,29 +105,8 @@ namespace SD::Camera::PresetFile
 		std::string              error;     // set when nothing in the file could be read
 	};
 
-	[[nodiscard]] inline std::string Lower(std::string_view a_text)
-	{
-		std::string out{ a_text };
-		for (auto& c : out) {
-			if (c >= 'A' && c <= 'Z') {
-				c = static_cast<char>(c - 'A' + 'a');
-			}
-		}
-		return out;
-	}
-
-	// "Push in", "pushIn" and "push_in" are the same name.
-	[[nodiscard]] inline std::string Simplify(std::string_view a_text)
-	{
-		std::string out;
-		for (const char c : a_text) {
-			if (c == ' ' || c == '-' || c == '_' || c == '\t') {
-				continue;
-			}
-			out += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-		}
-		return out;
-	}
+	using PresetRules::Lower;
+	using PresetRules::Simplify;
 
 	[[nodiscard]] inline int Lookup(const Names& a_names, std::string_view a_text)
 	{
@@ -306,6 +301,30 @@ namespace SD::Camera::PresetFile
 						Text(value, preset.author, key, warnings);
 					} else if (id == "description") {
 						Text(value, preset.description, key, warnings);
+					} else if (id == "use" || id == "basedon") {
+						Text(value, preset.use, key, warnings);
+					} else if (id == "when") {
+						// An empty block means always. A block whose every condition was a mistake
+						// must not turn into that.
+						PresetRules::Rules rules;
+						PresetRules::Read(value, rules, "when", warnings);
+						if (!rules.Empty() || (value.is_object() && value.empty())) {
+							preset.when = std::move(rules);
+						} else if (value.is_object()) {
+							warnings.emplace_back("Nothing in \"when\" could be used, so it never applies by itself.");
+						}
+					} else if (id == "unless") {
+						PresetRules::Rules rules;
+						PresetRules::Read(value, rules, "unless", warnings);
+						if (rules.Count() > 0) {
+							preset.unless = std::move(rules);
+						}
+					} else if (id == "priority") {
+						if (const auto number = Number(value)) {
+							preset.priority = Whole(*number);
+						} else {
+							warnings.emplace_back("\"priority\" should be a number; ignored.");
+						}
 					} else if (id == "cutting") {
 						ReadCutting(value, preset.cutting, warnings);
 					} else if (id == "angles") {
@@ -391,6 +410,20 @@ namespace SD::Camera::PresetFile
 		out += "    \"name\": " + Quote(a_preset.name) + ",\r\n";
 		out += "    \"author\": " + Quote(a_preset.author) + ",\r\n";
 		out += "    \"description\": " + Quote(a_preset.description) + ",\r\n";
+
+		if (!a_preset.use.empty()) {
+			out += "    \"use\": " + Quote(a_preset.use) + ",\r\n";
+		}
+		if (a_preset.when) {
+			out += "\r\n    \"when\": " + PresetRules::Write(*a_preset.when) + ",\r\n";
+		}
+		if (a_preset.unless) {
+			out += (a_preset.when ? "" : "\r\n") + std::string{ "    \"unless\": " } +
+			       PresetRules::Write(*a_preset.unless) + ",\r\n";
+		}
+		if (a_preset.priority) {
+			out += "    \"priority\": " + std::to_string(*a_preset.priority) + ",\r\n";
+		}
 
 		std::vector<std::string> fields;
 		const auto&              c = a_preset.cutting;

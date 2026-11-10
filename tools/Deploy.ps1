@@ -209,7 +209,10 @@ if (-not (Test-Path $liveIni)) {
 		# game. All three worked; all three wrote channels that belong to the
 		# engine and to whatever face mods are installed, and this is a camera mod.
 		'bExpressions', 'iExpressionStrength', 'bGaze', 'bHoldPlayerFace',
-		'iListenerGaze', 'iSpeakerGaze'
+		'iListenerGaze', 'iSpeakerGaze',
+		# Unreleased - the panning camera for walks, replaced before it shipped by
+		# still frames fitted to the movement (bFitShotsToMovement).
+		'bFilmWalksFromOneSpot'
 	)
 	$retiredSet = @{}
 	foreach ($r in $retired) { $retiredSet[$r] = $true }

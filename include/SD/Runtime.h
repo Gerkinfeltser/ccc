@@ -29,4 +29,7 @@ namespace SD::Runtime
 	// A load is starting. Drop everything that refers to the outgoing world,
 	// synchronously.
 	void AbandonForLoad();
+
+	// SKSE's kSaveGame, before the game writes the save.
+	void BeforeSave();
 }

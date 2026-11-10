@@ -57,12 +57,14 @@ Settings marked `(restart)` need a game restart.
 | Fade After PC Line | On, 1.5 s delay, 2 s fade |
 | Subtitles In The Black Bar | Off |
 | Hold On Their Answer (persuasion) | On |
-| Film When You Stand Still | Off; within 600 units, after 1.5 s |
+| Film When You Stand Still | On; within 600 units, after 1.5 s |
 | Film Their Conversation key | Unassigned |
 | Lip Sync Fallback | On |
 | Responsive Expressions | On |
 | Your Gestures Start With Your Line | On |
 | They Stop Working To Talk | On |
+| You Turn To Face Them | On |
+| Both Of Them In One Shot | On; 35%, up to 3 lines, within 220 units |
 | Lighting | Off |
 
 ## Presets
@@ -158,6 +160,70 @@ Without SKSE Menu Framework, set `[Presets] sApply=` in SD_user.ini to a
 built-in preset or an installed preset's name. It is applied on the next
 start and then cleared.
 
+### Presets by situation
+
+A preset can say when it should be used, and then it switches itself on for
+those conversations: an inn at night, a follower, a conversation outdoors in
+the rain. When the conversation ends, your own settings come back. Nothing it
+does is saved, so the menu always shows your own settings between
+conversations.
+
+The quickest way to make one is the Export section: set up the camera the way
+you want it, pick a place, time, weather or person under **Use It By
+Itself**, and export. **Who** also offers whoever you last spoke to by name.
+Installed presets that switch themselves on show an **Automatic** line under
+their description, and **Switch Presets By Situation** turns all of them off
+at once (`[Presets] bSituational`). Ticking one still applies it to your own
+settings, like any other preset.
+
+In a file, add a `when` block. Every condition in it has to hold, and a list
+holds if any entry in it does:
+
+```json
+{
+    "name": "Tavern Nights",
+    "use": "Close",
+    "when": { "location": ["inn", "The Winking Skeever"], "time": "night" },
+    "unless": { "who": "follower" },
+    "cutting": { "minimumLines": 4, "maximumLines": 7 }
+}
+```
+
+| Condition | What it checks | Examples |
+|---|---|---|
+| `inside` / `outside` | Whether you're in an interior | `true` |
+| `location` | Where you are, and every place that's inside of. A kind of place, a location's name, a location keyword or a form | `"inn"`, `"Whiterun"`, `"LocTypeDwarvenAutomatons"` |
+| `time` | The hour in game | `"day"` (6-20), `"night"` (20-6), `"morning"`, `"afternoon"`, `"evening"`, `"21:30-2"` |
+| `weather` | Outdoors only; nothing matches inside | `"clear"`, `"cloudy"`, `"rain"`, `"snow"` |
+| `who` | What the person you're talking to is | `"follower"`, `"merchant"`, `"innkeeper"`, `"guard"`, `"child"`, `"creature"` |
+| `npc` | A particular person, by name or form | `"Lydia"`, `"Skyrim.esm\|A2C8E"` |
+| `race` | Their race, by name, editor ID or form | `"Khajiit"`, `"Argonian"` |
+| `faction` | A faction they're in, by name or form | `"Skyrim.esm\|48362"` (the Companions) |
+| `keyword` | A keyword on them or their race | `"ActorTypeNPC"`, `"Vampire"` |
+| `conversation` | Yours, or one you're filming with the scene key | `"yours"`, `"overheard"` |
+| `chance` | How often it applies when everything else fits | `50` |
+
+Kinds of place: inn, city, town, settlement, home, dungeon, castle, temple,
+shop, jail, guild, farm, mine, camp, barracks, cemetery, ship. A city counts
+from anywhere inside it, so `"city"` also holds in that city's inn.
+
+Forms are written as `Plugin.esp|ID` (or `ID~Plugin.esp`); the load order
+byte copied from xEdit is ignored. Names match ignoring case and spaces.
+
+- `unless` takes the same conditions. If they all hold, the preset sits this
+  one out.
+- When more than one preset fits, the highest `priority` wins (default 0),
+  then the one with more conditions, then the first by name. A `when` that is
+  just `{}` fits everything, which is only useful with `chance` or a low
+  priority.
+- `use` starts from another preset, built-in (`"Standard"`, `"Close"`,
+  `"Room"`) or installed, so a file can change just a few things. `cutting`
+  then only changes what it lists. If `angles` is there it replaces the angle
+  list, and each angle the other preset also uses keeps its settings for
+  anything left out.
+- The log says which preset was chosen for each conversation and why, and
+  when one fits but loses its `chance` roll.
+
 ## The 180-degree rule
 
 **True 180 Rule** keeps the camera on one side of the conversation. You are
@@ -191,13 +257,26 @@ second opinion for modded checks.
 Two NPCs talking to each other can be filmed like a conversation of your own.
 The second NPC takes your place in every shot, so over-the-shoulders, reverses
 and the 180 rule all work. Their subtitles stay on screen; nothing of yours is
-touched, and the scene's own voices and faces are left to the game.
+touched, and the scene's own voices and faces are left to the game. NPCs
+sometimes talk across a room; while the two stand more than 300 units apart
+the over-the-shoulders are skipped, since the camera would have to stand
+behind the far one.
+
+Nothing films other people's conversations until you bind the key or turn
+on the automatic mode below; both ship off. The game's subtitle settings
+don't matter: lines are caught as the game starts them, subtitled or not.
+
+The HUD and other mods' widgets are hidden as in your own conversations.
+Interface a mod draws itself rather than as a game menu, such as Custom
+Markers' mini map, can't be hidden that way; mods that hide for Photo Mode
+do hide, because Photo Mode's `PhotoMode_IsActive` is raised while filming
+and put back afterwards.
 
 - **Film Their Conversation** (Keys page, `[Direction] iKeyFilmScene`):
   press it near a conversation in front of you to film it, press again to stop.
   It also works on one NPC talking at you or at a crowd.
 - **Film When You Stand Still** (Camera > Other People's Conversations,
-  `bFilmScenesAuto`, off by default): stand still within `iSceneRange` units
+  `bFilmScenesAuto`, on by default since 1.5.5): stand still within `iSceneRange` units
   of two NPCs talking to each other, with them near the middle of your view,
   for `iSceneWait` hundredths of a second, and filming starts on its own. It
   has to be a real conversation: the two of them in the same scene (how the
@@ -206,6 +285,40 @@ touched, and the scene's own voices and faces are left to the game.
   a merchant calling out — never starts it, unless it is part of a scene the
   game is playing with a second voice in it, as when several people brief you
   at once.
+- **Fit Still Shots To Their Movement** (Camera > Other People's
+  Conversations, `bFitShotsToMovement`, off by default): the camera never
+  follows anyone. At each cut it works out everywhere the person in the shot
+  is about to be, and stands as close as it can while all of it stays in
+  frame; then neither the camera nor its aim moves. Someone shifting about on
+  the spot keeps the shot close, often exactly as designed. Someone about to
+  cross the room takes it further back, or round to an angle the walk fits
+  better. It never comes closer than the shot itself would.
+
+  Where they'll be comes from where they've been over the last few seconds,
+  the scene's next move for them (read before they take a step, including a
+  walk queued for right after their line), their AI package, and how they're
+  already moving. A package that only has them talk to or watch somebody is
+  not a walk, and a walk a package promises that hasn't started a second and
+  a half later stops counting until they move. If they leave the frame
+  anyway, walk into the lens or go behind something, it cuts to a new angle.
+
+  The forecast is written to `SceneDirector.log` with this off as well, so you
+  can see what it would do first: a `Forecast for …` line at each cut where
+  someone is moving, naming where the prediction came from and the frame it
+  would use, and a `Walk check` line when the shot ends comparing it with how
+  far they actually went.
+- **Both Of Them In One Shot** (Camera > Other People's Conversations,
+  `bTogetherShot`, on by default): when the two being filmed stand within
+  `iTogetherReach` units of each other, a change of speaker has an
+  `iTogetherChance` percent chance of cutting to one shot of both of them
+  instead of to the new speaker. That shot then stays up for two to
+  `iTogetherLines` lines of their exchange, whoever is talking, and the line
+  after its last cuts back to the speaker. It ends early if someone else joins
+  in, someone walks out of it or changes posture, or you press a camera key,
+  and lets go at the next line once it has been up for 20 seconds. There are at
+  least three changes of speaker between two of them. It uses Both Of You and
+  Both Of You (Side On) from the Shots page, whichever are on, and needs
+  Keep Subject Visible off. The log names each one (`Two-shot: …`).
 
 Moving hands the camera back straight away, and the pair you walked out of is
 left alone for a while. Filming also stops when they go quiet, walk off, start
@@ -265,6 +378,15 @@ them.
 Inventory, barter, crafting and other menus suspend the camera presentation.
 Closing the menu resumes the conversation and selects a new shot if needed.
 
+**Voices Up Close** (Screen > Sound, `[Sound] bVoicesUpClose`, on by default)
+keeps dialogue at the same volume wherever the camera is. The game plays a
+line from the speaker's head and hears it from the camera, so a wide shot
+used to make the voice quieter and a reverse shot moved it to the other ear.
+With this on, the lines spoken by everyone in the conversation play from just
+in front of the camera, like dialogue recorded close to the actor; the rest of
+the world is still heard from where the camera stands. A line still playing
+when the conversation ends goes back to the speaker.
+
 ## Player voice and expressions
 
 DBVO 1, DBVO 2 and Dragonborn ReVoiced are detected automatically. A voice mod
@@ -291,6 +413,16 @@ condition start when the NPC replies, and this setting does not change them.
 forge, tanning rack, chopping block or similar steps away from it 3 to 5 seconds
 after they start talking. Seats, beds, lean spots and quest scenes are left
 alone. SceneDirector.log records whether they stood up.
+
+**You Turn To Face Them** (Faces > Body, `[Performance] bTurnToFace`): when a
+conversation starts, you turn to face whoever you're talking to, so someone you
+spoke to from the side isn't answered over your shoulder. A quarter turn takes
+about 0.4 seconds. If they end up more than 30 degrees off to one side during
+the conversation, you turn again. You aren't turned while seated, mounted,
+using furniture, in the air or knocked down, and if another mod keeps turning
+you during the conversation it's left to that mod. When the conversation ends,
+a free-look camera is put back looking where it was before, not swung round
+with your body.
 
 Eye & Cheek Detail needs a matching regional asset. The tested asset uses the
 High Poly Head female mesh and is not bundled. Other heads retain native

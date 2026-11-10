@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -66,5 +67,47 @@ namespace SD::Dialogue
 			}
 		}
 		return Ahead::kMarkingTime;
+	}
+
+	// The last phase that plays before the next line after this phase. A walk
+	// queued for right after the line being spoken sits in here before anyone
+	// moves: in the Helgen tower, Ralof's line is phase 10 and his run is phase 11.
+	[[nodiscard]] constexpr std::uint32_t LookAheadEnd(std::span<const ScriptLine> a_lines, std::uint32_t a_phase,
+		std::uint32_t a_phaseCount)
+	{
+		if (a_phaseCount == 0) {
+			return a_phase;
+		}
+		const auto next = NextSpokenPhase(a_lines, a_phase + 1, a_phaseCount);
+		const auto last = next >= a_phaseCount ? a_phaseCount - 1 : next - 1;
+		return last < a_phase ? a_phase : last;
+	}
+
+	// A package action: someone sent somewhere across a span of phases.
+	struct ScriptMove
+	{
+		std::uint16_t firstPhase{ 0 };
+		std::uint16_t lastPhase{ 0 };
+	};
+
+	// The move that starts soonest and still runs at some point in
+	// [a_phase, a_until], or -1.
+	[[nodiscard]] constexpr int FirstMove(std::span<const ScriptMove> a_moves, std::uint32_t a_phase,
+		std::uint32_t a_until)
+	{
+		int           best = -1;
+		std::uint32_t bestStart = 0;
+		for (std::size_t i = 0; i < a_moves.size(); ++i) {
+			const auto& move = a_moves[i];
+			if (move.lastPhase < move.firstPhase || move.lastPhase < a_phase || move.firstPhase > a_until) {
+				continue;
+			}
+			const std::uint32_t start = move.firstPhase > a_phase ? move.firstPhase : a_phase;
+			if (best < 0 || start < bestStart) {
+				best = static_cast<int>(i);
+				bestStart = start;
+			}
+		}
+		return best;
 	}
 }

@@ -15,9 +15,12 @@ namespace
 	}
 
 	using SD::Dialogue::Ahead;
+	using SD::Dialogue::FirstMove;
 	using SD::Dialogue::Look;
+	using SD::Dialogue::LookAheadEnd;
 	using SD::Dialogue::NextSpokenPhase;
 	using SD::Dialogue::ScriptLine;
+	using SD::Dialogue::ScriptMove;
 
 	// MQ101DragonAttackScene1 (000D0594), the Helgen tower, as Skyrim.esm has it:
 	// every dialogue action with a topic, by phase span and whether it loops.
@@ -88,6 +91,32 @@ int main()
 
 	// No lines at all.
 	Expect(Look(std::span<const ScriptLine>{}, 0, 4) == Ahead::kNothing, "a scene of movement only");
+
+	// Looking ahead for a walk. Ralof's line is phase 10; the run is 11 and the
+	// timer 12, and the repeats start at 13, so a cut on his line can see the run.
+	Expect(LookAheadEnd(kTower, 10, kTowerPhases) == 12, "the run and the timer are before the next line");
+	Expect(LookAheadEnd(kTower, 1, kTowerPhases) == 1, "a line straight after another leaves nothing between");
+	Expect(LookAheadEnd(kTower, 25, kTowerPhases) == 25, "the last line looks no further than its own phase");
+	Expect(LookAheadEnd(kWalkOff, 3, 6) == 5, "after the last line, the rest of the scene");
+	Expect(LookAheadEnd(std::span<const ScriptLine>{}, 2, 0) == 2, "an empty scene");
+
+	constexpr std::array<ScriptMove, 3> kMoves{ {
+		{ 11, 11 },  // Ralof runs for the tower
+		{ 14, 15 },
+		{ 4, 2 },    // reversed, ignored
+	} };
+	Expect(FirstMove(kMoves, 10, LookAheadEnd(kTower, 10, kTowerPhases)) == 0, "the run is found from the line");
+	Expect(FirstMove(kMoves, 11, 12) == 0, "the run while it plays");
+	Expect(FirstMove(kMoves, 12, 12) == -1, "nothing once the run is over");
+	Expect(FirstMove(kMoves, 13, 20) == 1, "the next walk inside the tower");
+	Expect(FirstMove(kMoves, 0, 3) == -1, "a reversed span says nothing");
+
+	constexpr std::array<ScriptMove, 2> kOverlap{ {
+		{ 8, 12 },
+		{ 6, 9 },
+	} };
+	Expect(FirstMove(kOverlap, 7, 10) == 1, "the move already running wins over one starting later");
+	Expect(FirstMove(kOverlap, 10, 10) == 0, "only the one still running");
 
 	std::cout << "SceneScript: all tests passed\n";
 	return EXIT_SUCCESS;

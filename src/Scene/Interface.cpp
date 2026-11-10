@@ -9,10 +9,28 @@ namespace SD::Scene
 	{
 		bool suppressed{ false };
 
-		// What this mod hid, at the two levels it hides from. Two lists because each
+		// A clip held off screen through two properties at once. HUD code and mods
+		// usually drive one of them (the engine's mode switch sets _visible, fades and
+		// toggles like Toggle Compass set _alpha), so with both held a write to either
+		// one alone shows nothing. _visible is only taken from clips that were
+		// showing; a clip its owner had already hidden keeps its own _visible and is
+		// held by _alpha alone, so it stays off if the owner shows it mid-scene.
+		struct HeldClip
+		{
+			std::string name;
+			double      alpha{ 100.0 };  // restored on release
+			bool        hidVisible{ false };
+		};
+
+		// What this mod holds, at the two levels it hides from. Two lists because each
 		// is restored through its own parent (the base clip, or _root).
-		std::vector<std::string> hidden;      // children of HUDMovieBaseInstance
-		std::vector<std::string> hiddenRoot;  // children of _root that are not it
+		std::vector<HeldClip> hidden;      // children of HUDMovieBaseInstance
+		std::vector<HeldClip> hiddenRoot;  // children of _root that are not it
+
+		// The thread Enforce runs on (the game's main thread). The draw-time hold only
+		// touches Scaleform from that same thread.
+		std::atomic<std::uint32_t> holdThread{ 0 };
+		Log::OnceFlag              drawThreadReported;
 
 		Log::OnceFlag            inventoryReported;
 
@@ -139,7 +157,59 @@ namespace SD::Scene
 			"Overlay Interaction Menu"sv,
 		};
 
-		std::vector<std::string> hiddenMenus;
+		// Held foreign menus, by their _root (same two properties as HeldClip).
+		std::vector<HeldClip> hiddenMenus;
+
+		[[nodiscard]] bool Holds(const std::vector<HeldClip>& a_list, std::string_view a_name)
+		{
+			return std::any_of(a_list.begin(), a_list.end(),
+				[&](const HeldClip& a_held) { return a_held.name == a_name; });
+		}
+
+		// Takes a_clip off screen and records how to give it back. Returns false when
+		// it isn't a display object.
+		[[nodiscard]] bool TakeClip(RE::GFxValue& a_clip, std::string a_name, std::vector<HeldClip>& a_into)
+		{
+			if (!a_clip.IsDisplayObject()) {
+				return false;
+			}
+			HeldClip held{ std::move(a_name) };
+
+			RE::GFxValue visible;
+			held.hidVisible = !(a_clip.GetMember("_visible", &visible) && visible.IsBool() && !visible.GetBool());
+
+			RE::GFxValue alpha;
+			held.alpha = a_clip.GetMember("_alpha", &alpha) && alpha.IsNumber() ? alpha.GetNumber() : 100.0;
+
+			if (held.hidVisible) {
+				a_clip.SetMember("_visible", RE::GFxValue{ false });
+			}
+			a_clip.SetMember("_alpha", RE::GFxValue{ 0.0 });
+			a_into.push_back(std::move(held));
+			return true;
+		}
+
+		void HoldClip(RE::GFxValue& a_clip, const HeldClip& a_held)
+		{
+			if (!a_clip.IsDisplayObject()) {
+				return;
+			}
+			if (a_held.hidVisible) {
+				a_clip.SetMember("_visible", RE::GFxValue{ false });
+			}
+			a_clip.SetMember("_alpha", RE::GFxValue{ 0.0 });
+		}
+
+		void ReleaseClip(RE::GFxValue& a_clip, const HeldClip& a_held)
+		{
+			if (!a_clip.IsDisplayObject()) {
+				return;
+			}
+			a_clip.SetMember("_alpha", RE::GFxValue{ a_held.alpha });
+			if (a_held.hidVisible) {
+				a_clip.SetMember("_visible", RE::GFxValue{ true });
+			}
+		}
 
 		// Spared menus already named in the log, so each is logged once.
 		std::vector<std::string> sparedReported;
@@ -179,9 +249,10 @@ namespace SD::Scene
 
 		PathProbe choiceProbe;
 
-		// Frames between foreign-menu sweeps: about four a second, which is plenty for
-		// catching a newly opened menu.
-		constexpr int kSweepFrames = 15;
+		// Frames between sweeps for newly opened menus. What's already held is
+		// re-applied every frame; this only bounds how long a menu that opened
+		// mid-conversation can show before it's found.
+		constexpr int kSweepFrames = 5;
 		int           sweepCountdown{ 0 };
 
 		// Rows inside the topic list, for the highlighted entry's text. A separate
@@ -401,10 +472,14 @@ namespace SD::Scene
 
 				RE::GFxValue root;
 				RE::GFxValue visible;
+				RE::GFxValue alpha;
 				if (!entry.second.menu->uiMovie->GetVariable(&root, "_root") || !root.IsDisplayObject()) {
 					continue;
 				}
 				if (root.GetMember("_visible", &visible) && visible.IsBool() && !visible.GetBool()) {
+					continue;
+				}
+				if (root.GetMember("_alpha", &alpha) && alpha.IsNumber() && alpha.GetNumber() <= 0.0) {
 					continue;
 				}
 
@@ -441,7 +516,7 @@ namespace SD::Scene
 									 Flag::kAssignCursorToRenderer);
 		}
 
-		[[nodiscard]] bool EnumerateChildren(RE::GFxValue& a_parent, std::vector<std::string>& a_out);
+		[[nodiscard]] bool EnumerateChildren(RE::GFxValue& a_parent, std::vector<std::string>& a_out, bool a_timeline = true);
 
 		[[nodiscard]] const PartialKeep* FindPartialKeep(std::string_view a_menu)
 		{
@@ -453,8 +528,10 @@ namespace SD::Scene
 		// Fades every child of a_keep.parent except a_keep.keep. Uses _alpha, not
 		// _visible, because TrueHUD sets _visible on these containers itself on every
 		// menu change. Returns false if the parent can't be found, so the caller can
-		// hide the whole movie instead.
-		[[nodiscard]] bool FadeAllBut(RE::IMenu* a_menu, std::string_view a_menuName, const PartialKeep& a_keep)
+		// hide the whole movie instead. a_timeline false re-checks only the depths
+		// filled at runtime, which is where containers added later end up.
+		[[nodiscard]] bool FadeAllBut(RE::IMenu* a_menu, std::string_view a_menuName, const PartialKeep& a_keep,
+			bool a_timeline = true)
 		{
 			auto view = a_menu ? a_menu->uiMovie : nullptr;
 			RE::GFxValue parent;
@@ -463,7 +540,7 @@ namespace SD::Scene
 			}
 
 			std::vector<std::string> children;
-			if (!EnumerateChildren(parent, children)) {
+			if (!EnumerateChildren(parent, children, a_timeline)) {
 				return false;
 			}
 
@@ -514,6 +591,7 @@ namespace SD::Scene
 			}
 
 			std::string list;
+			std::string dormant;
 			std::string spared;
 			for (auto& entry : ui->menuMap) {
 				const char* raw = entry.first.c_str();
@@ -544,34 +622,47 @@ namespace SD::Scene
 					continue;
 				}
 
-				// Already held either way; ReassertForeignMenus keeps it.
-				const bool heldWhole = std::find(hiddenMenus.begin(), hiddenMenus.end(), name) != hiddenMenus.end();
-				const bool heldPartly = std::find(partialMenus.begin(), partialMenus.end(), name) != partialMenus.end();
-				if (heldPartly) {
+				// Already held either way; HoldForeignMenus keeps it.
+				if (Holds(hiddenMenus, name)) {
 					continue;
 				}
-				if (const auto* keep = FindPartialKeep(name); keep && !heldWhole &&
-					FadeAllBut(entry.second.menu.get(), name, *keep)) {
+				const auto* keep = FindPartialKeep(name);
+				if (std::find(partialMenus.begin(), partialMenus.end(), name) != partialMenus.end()) {
+					// Containers added since the first pass (TrueHUD add-ons attach theirs at
+					// runtime). Only the runtime depths, so this stays cheap.
+					if (keep) {
+						static_cast<void>(FadeAllBut(entry.second.menu.get(), name, *keep, false));
+					}
+					continue;
+				}
+				if (keep && FadeAllBut(entry.second.menu.get(), name, *keep)) {
 					partialMenus.push_back(name);
 					Log::Info(Log::Category::kStaging,
 						"Foreign menu {}: kept {} visible, faded the rest."sv, name, keep->keep);
 					continue;
 				}
 
-				if (!SetMovieVisible(entry.second.menu.get(), false, true)) {
+				// Held whether it's showing or not. A widget its owner has switched off now
+				// is often switched back on by that owner mid-scene (a mode change, a camera
+				// change, a poll), and it would then be on screen until the next sweep.
+				auto         view = entry.second.menu ? entry.second.menu->uiMovie : nullptr;
+				RE::GFxValue root;
+				if (!view || !view->GetVariable(&root, "_root") || !root.IsDisplayObject()) {
+					continue;
+				}
+				RE::GFxValue visible;
+				RE::GFxValue alpha;
+				const bool   showing = !(root.GetMember("_visible", &visible) && visible.IsBool() && !visible.GetBool()) &&
+					!(root.GetMember("_alpha", &alpha) && alpha.IsNumber() && alpha.GetNumber() <= 0.0);
+				if (!TakeClip(root, name, hiddenMenus)) {
 					continue;
 				}
 
-				// A menu its owner shows again between sweeps comes back through here, so
-				// don't add it twice.
-				if (std::find(hiddenMenus.begin(), hiddenMenus.end(), name) == hiddenMenus.end()) {
-					hiddenMenus.push_back(name);
+				auto& names = showing ? list : dormant;
+				if (!names.empty()) {
+					names += ", ";
 				}
-
-				if (!list.empty()) {
-					list += ", ";
-				}
-				list += name;
+				names += name;
 			}
 
 			if (!spared.empty()) {
@@ -582,20 +673,25 @@ namespace SD::Scene
 			if (!list.empty()) {
 				Log::Info(Log::Category::kStaging, "Foreign menus hidden: {}"sv, list);
 			}
+			if (!dormant.empty()) {
+				Log::Info(Log::Category::kStaging, "Foreign menus held while switched off: {}"sv, dormant);
+			}
 		}
 
-		// Re-apply the hide on menus already taken. The sweep above skips anything
-		// already hidden (by design), so this is what holds them.
-		void ReassertForeignMenus()
+		// Re-apply the hold on menus already taken, every frame.
+		void HoldForeignMenus()
 		{
 			auto* ui = RE::UI::GetSingleton();
 			if (!ui) {
 				return;
 			}
 
-			for (const auto& name : hiddenMenus) {
-				if (auto menu = ui->GetMenu(name)) {
-					static_cast<void>(SetMovieVisible(menu.get(), false, false));
+			for (const auto& held : hiddenMenus) {
+				auto         menu = ui->GetMenu(held.name);
+				auto         view = menu ? menu->uiMovie : nullptr;
+				RE::GFxValue root;
+				if (view && view->GetVariable(&root, "_root")) {
+					HoldClip(root, held);
 				}
 			}
 
@@ -607,9 +703,12 @@ namespace SD::Scene
 		{
 			auto* ui = RE::UI::GetSingleton();
 			if (ui) {
-				for (const auto& name : hiddenMenus) {
-					if (auto menu = ui->GetMenu(name)) {
-						static_cast<void>(SetMovieVisible(menu.get(), true, false));
+				for (const auto& held : hiddenMenus) {
+					auto         menu = ui->GetMenu(held.name);
+					auto         view = menu ? menu->uiMovie : nullptr;
+					RE::GFxValue root;
+					if (view && view->GetVariable(&root, "_root")) {
+						ReleaseClip(root, held);
 					}
 				}
 			}
@@ -659,8 +758,9 @@ namespace SD::Scene
 		// Every child, found by asking the movie. Members can't be listed, but AS2's
 		// getInstanceAtDepth can be called for each depth and the result's _name read,
 		// which works for any HUD. Returns false only when the walk found nothing at
-		// all, so the caller falls back.
-		[[nodiscard]] bool EnumerateChildren(RE::GFxValue& a_parent, std::vector<std::string>& a_out)
+		// all, so the caller falls back. a_timeline false skips the timeline band,
+		// which is a thousand calls and can't change after the movie loads.
+		[[nodiscard]] bool EnumerateChildren(RE::GFxValue& a_parent, std::vector<std::string>& a_out, bool a_timeline)
 		{
 			const auto collect = [&](std::int32_t a_depth) {
 				RE::GFxValue arg{ static_cast<double>(a_depth) };
@@ -688,7 +788,7 @@ namespace SD::Scene
 
 			const auto before = a_out.size();
 
-			for (std::int32_t i = 0; i < kTimelineSpan; ++i) {
+			for (std::int32_t i = 0; a_timeline && i < kTimelineSpan; ++i) {
 				collect(kTimelineBase + i);
 			}
 
@@ -765,24 +865,19 @@ namespace SD::Scene
 				}
 
 				RE::GFxValue member;
-				if (!base.GetMember(name.c_str(), &member) || !member.IsDisplayObject()) {
+				if (!base.GetMember(name.c_str(), &member) || !TakeClip(member, name, hidden)) {
 					continue;
 				}
 
-				// Skip anything already hidden, so restoring can't show an element the player
-				// or another mod turned off.
-				RE::GFxValue visible;
-				if (member.GetMember("_visible", &visible) && visible.IsBool() && !visible.GetBool()) {
-					continue;
-				}
-
-				member.SetMember("_visible", RE::GFxValue{ false });
-				hidden.push_back(name);
-
+				// An element the player or another mod had turned off is held too (by
+				// _alpha), and its _visible is never written, so the restore can't show it.
 				if (!taken.empty()) {
 					taken += ", ";
 				}
 				taken += name;
+				if (!hidden.back().hidVisible) {
+					taken += " (was off)";
+				}
 			}
 
 			// One level up, for anything sharing _root with the base clip. Vanilla has
@@ -800,22 +895,17 @@ namespace SD::Scene
 					}
 
 					RE::GFxValue member;
-					if (!root.GetMember(name.c_str(), &member) || !member.IsDisplayObject()) {
+					if (!root.GetMember(name.c_str(), &member) || !TakeClip(member, name, hiddenRoot)) {
 						continue;
 					}
-
-					RE::GFxValue visible;
-					if (member.GetMember("_visible", &visible) && visible.IsBool() && !visible.GetBool()) {
-						continue;
-					}
-
-					member.SetMember("_visible", RE::GFxValue{ false });
-					hiddenRoot.push_back(name);
 
 					if (!taken.empty()) {
 						taken += ", ";
 					}
 					taken += "_root." + name;
+					if (!hiddenRoot.back().hidVisible) {
+						taken += " (was off)";
+					}
 				}
 			}
 
@@ -896,56 +986,66 @@ namespace SD::Scene
 		suppressed = true;
 	}
 
+	namespace
+	{
+		// Re-applies everything held. Only what this mod took is in the lists, and
+		// released elements never are.
+		void HoldEverything()
+		{
+			// The root hide, with onlyIfShown off: it's already hidden by us, so the guard
+			// would stop it holding.
+			if (hudHidden) {
+				static_cast<void>(SetMovieVisible(HudMenu().get(), false, false));
+			}
+
+			if (!hidden.empty()) {
+				RE::GPtr<RE::IMenu> menu;
+				RE::GFxValue        base;
+				if (AcquireBase(menu, base)) {
+					for (const auto& held : hidden) {
+						RE::GFxValue member;
+						if (base.GetMember(held.name.c_str(), &member)) {
+							HoldClip(member, held);
+						}
+					}
+				}
+			}
+
+			if (!hiddenRoot.empty()) {
+				RE::GPtr<RE::IMenu> menu;
+				RE::GFxValue        root;
+				if (AcquireRoot(menu, root)) {
+					for (const auto& held : hiddenRoot) {
+						RE::GFxValue member;
+						if (root.GetMember(held.name.c_str(), &member)) {
+							HoldClip(member, held);
+						}
+					}
+				}
+			}
+
+			HoldForeignMenus();
+		}
+	}
+
 	void Interface::Enforce()
 	{
+		holdThread.store(::GetCurrentThreadId(), std::memory_order_relaxed);
+
 		if (!suppressed) {
 			return;
 		}
 
-		// The root hide, reapplied every frame with onlyIfShown off: it's already
-		// hidden by us, so the guard would stop it holding.
-		if (hudHidden) {
-			static_cast<void>(SetMovieVisible(HudMenu().get(), false, false));
-		}
+		HoldEverything();
 
-		// Same for the children. Only elements this mod hid are in these lists, so
-		// nothing that was already off gets touched and released elements are never
-		// reached.
-		if (!hidden.empty()) {
-			RE::GPtr<RE::IMenu> menu;
-			RE::GFxValue        base;
-			if (AcquireBase(menu, base)) {
-				for (const auto& name : hidden) {
-					RE::GFxValue member;
-					if (base.GetMember(name.c_str(), &member) && member.IsDisplayObject()) {
-						member.SetMember("_visible", RE::GFxValue{ false });
-					}
-				}
-			}
-		}
-
-		if (!hiddenRoot.empty()) {
-			RE::GPtr<RE::IMenu> menu;
-			RE::GFxValue        root;
-			if (AcquireRoot(menu, root)) {
-				for (const auto& name : hiddenRoot) {
-					RE::GFxValue member;
-					if (root.GetMember(name.c_str(), &member) && member.IsDisplayObject()) {
-						member.SetMember("_visible", RE::GFxValue{ false });
-					}
-				}
-			}
-		}
-
-		// Menus are the throttled part; walking ui->menuMap scales with what's
-		// installed.
+		// Looking for newly opened menus is the throttled part; walking ui->menuMap
+		// scales with what's installed.
 		if (--sweepCountdown > 0) {
 			return;
 		}
 		sweepCountdown = kSweepFrames;
 
-		SuppressForeignMenus();   // newcomers
-		ReassertForeignMenus();   // what we already hold
+		SuppressForeignMenus();
 
 		// Keep retrying the children while the root hide is in place. HUDMenu may not
 		// be ready on the frame a conversation stages (after a cell load, on arrival
@@ -965,6 +1065,25 @@ namespace SD::Scene
 				Log::Info(Log::Category::kStaging,
 					"HUD children turned up late; the keep-list is on and notifications with it."sv);
 			}
+		}
+	}
+
+	void Interface::HoldBeforeDraw()
+	{
+		// Scaleform is single-threaded; only hold from the thread that runs the tick.
+		const auto tickThread = holdThread.load(std::memory_order_relaxed);
+		if (tickThread == 0) {
+			return;
+		}
+		if (::GetCurrentThreadId() != tickThread) {
+			if (drawThreadReported.Take()) {
+				Log::Warn(Log::Category::kStaging,
+					"The HUD draws on a different thread from the game update; the interface is held from the update only."sv);
+			}
+			return;
+		}
+		if (suppressed) {
+			HoldEverything();
 		}
 	}
 
@@ -1183,10 +1302,10 @@ namespace SD::Scene
 		RE::GPtr<RE::IMenu> rootMenu;
 		RE::GFxValue        root;
 		if (AcquireRoot(rootMenu, root)) {
-			for (const auto& name : hiddenRoot) {
+			for (const auto& held : hiddenRoot) {
 				RE::GFxValue member;
-				if (root.GetMember(name.c_str(), &member) && member.IsDisplayObject()) {
-					member.SetMember("_visible", RE::GFxValue{ true });
+				if (root.GetMember(held.name.c_str(), &member)) {
+					ReleaseClip(member, held);
 				}
 			}
 		}
@@ -1199,10 +1318,10 @@ namespace SD::Scene
 			return;
 		}
 
-		for (const auto& name : hidden) {
+		for (const auto& held : hidden) {
 			RE::GFxValue member;
-			if (base.GetMember(name.c_str(), &member) && member.IsDisplayObject()) {
-				member.SetMember("_visible", RE::GFxValue{ true });
+			if (base.GetMember(held.name.c_str(), &member)) {
+				ReleaseClip(member, held);
 			}
 		}
 

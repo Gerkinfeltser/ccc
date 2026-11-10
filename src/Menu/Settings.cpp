@@ -2,6 +2,7 @@
 
 #include "SD/Camera/Director.h"
 #include "SD/Camera/Presets.h"
+#include "SD/Camera/Situational.h"
 #include "SD/Camera/Shot.h"
 #include "SD/Core/Config.h"
 #include "SD/Core/Hotkeys.h"
@@ -83,6 +84,7 @@ namespace SD::Menu
 		constexpr unsigned kIconTimer = 0xf017u;     // clock
 		constexpr unsigned kIconLine = 0xf075u;      // comment
 		constexpr unsigned kIconHold = 0xf04bu;      // play
+		constexpr unsigned kIconSound = 0xf028u;     // volume-up
 
 		// Cached: UnicodeToUtf8 builds a converter and a string per call, and this
 		// runs per icon per frame.
@@ -378,6 +380,29 @@ namespace SD::Menu
 			return changed;
 		}
 
+		// A dropdown row over a list of labels. a_choice indexes a_items.
+		void ChoiceRow(const char* a_label, const char* a_id, int& a_choice,
+			const std::vector<std::string>& a_items)
+		{
+			Row(a_label);
+			if (a_items.empty()) {
+				return;
+			}
+			a_choice = std::clamp(a_choice, 0, static_cast<int>(a_items.size()) - 1);
+			if (Im::BeginCombo(a_id, a_items[static_cast<std::size_t>(a_choice)].c_str())) {
+				for (std::size_t i = 0; i < a_items.size(); ++i) {
+					const bool selected = static_cast<int>(i) == a_choice;
+					if (Im::Selectable(a_items[i].c_str(), selected)) {
+						a_choice = static_cast<int>(i);
+					}
+					if (selected) {
+						Im::SetItemDefaultFocus();
+					}
+				}
+				Im::EndCombo();
+			}
+		}
+
 		// An amber warning with an icon, wrapped.
 		void Warning(const char* a_text)
 		{
@@ -517,6 +542,25 @@ namespace SD::Menu
 						"Two NPCs talking to each other in front of you are filmed like a "
 						"conversation of your own once you have stood still nearby for a "
 						"moment. Moving hands the camera back.");
+					changed |= ToggleRow("Show When There Is One To Watch", dials.watchSign,
+						"Direction", "bWatchSign",
+						"With Film When You Stand Still on, a camera in a ring appears over "
+						"your head (or at the crosshair in first person) while two people "
+						"nearby are talking. The ring fills as you stand still, and filming "
+						"starts when it closes.");
+					changed |= ToggleRow("Fit Still Shots To Their Movement", dials.fitShotsToMovement,
+						"Direction", "bFitShotsToMovement",
+						"The camera never follows anyone. Each shot stands as close as it can "
+						"while everywhere they're about to move stays in frame: a few steps "
+						"keep it near, a walk across the room takes it back or round to a "
+						"better angle. Their next move is read from the scene before they "
+						"take a step.");
+					changed |= ToggleRow("Both Of Them In One Shot", dials.twoShotHold,
+						"Direction", "bTogetherShot",
+						"Two people standing together sometimes get one shot of both of "
+						"them, held for a couple of lines while they talk instead of cutting "
+						"to each speaker. Uses Both Of You and Both Of You (Side On) from the "
+						"Shots page, whichever are on.");
 					EndRows();
 				}
 				Im::BeginDisabled(!dials.sceneAuto);
@@ -525,6 +569,17 @@ namespace SD::Menu
 						"Direction", "iSceneRange", "%d units");
 					changed |= SecondsRow("Stand Still For", dials.sceneWait, 0, 600,
 						"Direction", "iSceneWait");
+					EndRows();
+				}
+				Im::EndDisabled();
+				Im::BeginDisabled(!dials.twoShotHold);
+				if (BeginRows("cutScenesTwoShot")) {
+					changed |= SliderRow("One Shot Chance", dials.twoShotChance, 0, 100,
+						"Direction", "iTogetherChance", "%d%%");
+					changed |= SliderRow("Hold For Up To", dials.twoShotLines, 2, 6,
+						"Direction", "iTogetherLines", "%d lines");
+					changed |= SliderRow("Together Within", dials.twoShotReach, 80, 400,
+						"Direction", "iTogetherReach", "%d units");
 					EndRows();
 				}
 				Im::EndDisabled();
@@ -767,6 +822,19 @@ namespace SD::Menu
 				Im::Unindent();
 			}
 
+			if (Group(kIconSound, "Sound", "screenSound")) {
+				Im::Indent();
+				if (BeginRows("screenSoundGrid")) {
+					changed |= ToggleRow("Voices Up Close", dials.voicesUpClose,
+						"Sound", "bVoicesUpClose",
+						"Everyone in the conversation is heard at full volume from the middle "
+						"of the screen, however far away the camera is. Off, voices get quieter "
+						"on wide shots and swap ears when the camera cuts to the other side.");
+					EndRows();
+				}
+				Im::Unindent();
+			}
+
 			if (changed) {
 				Camera::Director::ApplyTunables(dials);
 			}
@@ -839,6 +907,11 @@ namespace SD::Menu
 				auto dials = Camera::Director::GetTunables();
 				bool changed = false;
 				if (BeginRows("faceBodyRows")) {
+					changed |= ToggleRow("You Turn To Face Them", dials.turnToFace,
+						"Performance", "bTurnToFace",
+						"When a conversation starts you turn to face whoever you're talking "
+						"to, and again if they end up well off to one side. Not while "
+						"seated, mounted or using furniture.");
 					changed |= ToggleRow("Your Gestures Start With Your Line", dials.playerGestureCue,
 						"Performance", "bPlayerGestureCue",
 						"Sends the PlayDBVOTopic event when your voiced line starts, so a "
@@ -1640,6 +1713,30 @@ namespace SD::Menu
 				return;
 			}
 
+			// Only shown once something can switch itself on.
+			const bool anySituational = std::ranges::any_of(installed,
+				[](const Camera::InstalledPreset& a_preset) { return a_preset.usable && a_preset.when; });
+			if (anySituational) {
+				auto dials = Camera::Director::GetTunables();
+				Icon(kIconTimer, dials.situationalPresets ? kGreen : kMuted);
+				Im::PushStyleColor(kColCheck, kGreen);
+				if (Im::Checkbox("Switch Presets By Situation", &dials.situationalPresets)) {
+					Config::SetBool("Presets", "bSituational", dials.situationalPresets);
+					Camera::Director::ApplyTunables(dials);
+				}
+				Im::PopStyleColor();
+				Help("Presets marked Automatic take over the conversations they describe, then hand "
+					 "back to your own settings when it ends. Nothing they do is saved.");
+
+				if (const auto inUse = Camera::Situational::Current(); !inUse.empty()) {
+					Icon(kIconCheck, kGreen);
+					Im::PushStyleColor(kColText, kGreen);
+					Im::TextWrapped("This conversation: %s", inUse.c_str());
+					Im::PopStyleColor();
+				}
+				Im::Spacing();
+			}
+
 			for (std::size_t i = 0; i < installed.size(); ++i) {
 				const auto& preset = installed[i];
 				const bool  current = presetState.activeInstalled == static_cast<int>(i);
@@ -1667,6 +1764,20 @@ namespace SD::Menu
 				Im::TextWrapped("      %s", about.c_str());
 				Im::PopStyleColor();
 
+				if (preset.when) {
+					std::string rule = "Automatic: " +
+						Camera::PresetRules::Describe(*preset.when, Camera::Situational::NameOf);
+					if (preset.unless) {
+						rule += "; not " + Camera::PresetRules::Describe(*preset.unless, Camera::Situational::NameOf);
+					}
+					if (preset.priority != 0) {
+						rule += " (priority " + std::to_string(preset.priority) + ")";
+					}
+					Im::PushStyleColor(kColText, kBlue);
+					Im::TextWrapped("      %s", rule.c_str());
+					Im::PopStyleColor();
+				}
+
 				// A broken file can't be ticked; a file with typos still can, minus the
 				// parts that were skipped.
 				if (!preset.problem.empty()) {
@@ -1693,6 +1804,81 @@ namespace SD::Menu
 			}
 		}
 
+		// The situation an exported preset switches itself on in. Everything at its
+		// first choice means none: the preset is only applied from this page. The file
+		// can say more than these (several places, hours, factions, races); see
+		// USAGE.md.
+		[[nodiscard]] Camera::PresetRules::Rules RenderSituation()
+		{
+			namespace PR = Camera::PresetRules;
+
+			static int where = 0;
+			static int place = 0;
+			static int time = 0;
+			static int weather = 0;
+			static int who = 0;
+			static int whose = 0;
+
+			// Menu label, then the word the file uses.
+			static const std::vector<std::pair<std::string, std::string>> kPlaces{ { "Any Place", "" },
+				{ "Inns", "inn" }, { "Cities", "city" }, { "Towns", "town" }, { "Villages", "settlement" },
+				{ "Homes", "home" }, { "Castles", "castle" }, { "Temples", "temple" }, { "Shops", "shop" },
+				{ "Dungeons", "dungeon" }, { "Camps", "camp" } };
+			static const std::vector<std::pair<std::string, std::string>> kWho{ { "Anyone", "" },
+				{ "Followers", "follower" }, { "Merchants", "merchant" }, { "Innkeepers", "innkeeper" },
+				{ "Guards", "guard" }, { "Children", "child" }, { "Creatures", "creature" } };
+			const auto labels = [](const std::vector<std::pair<std::string, std::string>>& a_items) {
+				std::vector<std::string> out;
+				for (const auto& item : a_items) {
+					out.push_back(item.first);
+				}
+				return out;
+			};
+
+			// Whoever was spoken to last can be picked by name.
+			const auto person = Camera::Situational::LastPerson();
+			auto       whoLabels = labels(kWho);
+			if (person && !person->name.empty()) {
+				whoLabels.push_back("Only " + person->name);
+			}
+
+			Im::Spacing();
+			Text(kMuted, "Use It By Itself");
+			if (BeginRows("exportWhen")) {
+				ChoiceRow("Where", "###where", where, { "Anywhere", "Indoors", "Outdoors" });
+				ChoiceRow("Place", "###place", place, labels(kPlaces));
+				ChoiceRow("Time", "###time", time, { "Any Time", "Day", "Night", "Morning", "Afternoon", "Evening" });
+				ChoiceRow("Weather", "###weather", weather, { "Any Weather", "Clear", "Cloudy", "Rain", "Snow" });
+				ChoiceRow("Who", "###who", who, whoLabels);
+				ChoiceRow("Conversation", "###whose", whose, { "Yours Or Overheard", "Yours", "Overheard" });
+				EndRows();
+			}
+
+			PR::Rules rules;
+			if (where > 0) {
+				rules.inside = where == 1;
+			}
+			if (place > 0) {
+				rules.location.push_back(kPlaces[static_cast<std::size_t>(place)].second);
+			}
+			if (time > 0) {
+				const auto& named = PR::kTimes[static_cast<std::size_t>(time - 1)];
+				rules.time.push_back({ named.from, named.to, std::string{ named.word } });
+			}
+			if (weather > 0) {
+				rules.weather.push_back(std::string{ PR::kWeather[static_cast<std::size_t>(weather - 1)].front() });
+			}
+			if (who > 0 && static_cast<std::size_t>(who) < kWho.size()) {
+				rules.who.push_back(kWho[static_cast<std::size_t>(who)].second);
+			} else if (who > 0 && person) {
+				rules.npc.push_back(person->form.empty() ? person->name : person->form);
+			}
+			if (whose > 0) {
+				rules.overheard = whose == 2;
+			}
+			return rules;
+		}
+
 		void RenderExport()
 		{
 			static std::array<char, 64>  name{};
@@ -1705,7 +1891,8 @@ namespace SD::Menu
 			Im::SeparatorText("EXPORT");
 			Im::PopStyleColor();
 
-			Note("Saves the current settings as a preset file, to share or to package as a mod.");
+			Note("Saves the current settings as a preset file, to share or to package as a mod. "
+				 "Pick a situation and it also switches itself on there.");
 
 			Im::PushID("export");
 
@@ -1721,6 +1908,8 @@ namespace SD::Menu
 			Im::SetNextItemWidth(320.0f);
 			Im::InputTextWithHint("Description", "optional, one line", description.data(), description.size());
 
+			const auto when = RenderSituation();
+
 			const bool named = name[0] != '\0';
 
 			// Exporting under a name that's already installed replaces that file.
@@ -1729,7 +1918,8 @@ namespace SD::Menu
 			Im::BeginDisabled(!named);
 			Icon(kIconSave, named ? kBlue : kMuted);
 			if (Im::Button(replaces ? "Replace Installed File" : "Export Current Settings")) {
-				result = Camera::ExportPreset(name.data(), author.data(), description.data());
+				result = Camera::ExportPreset(name.data(), author.data(), description.data(),
+					when.Empty() ? nullptr : &when);
 				RefreshPresetState(true);
 			}
 			Im::EndDisabled();
@@ -1895,6 +2085,7 @@ namespace SD::Menu
 				Config::SetBool("Direction", "bFollowFace", defaults.followFace);
 				Config::SetBool("Performance", "bPlayerGestureCue", defaults.playerGestureCue);
 				Config::SetBool("Performance", "bStopWorkToTalk", defaults.stopWorkToTalk);
+				Config::SetBool("Performance", "bTurnToFace", defaults.turnToFace);
 				Config::SetBool("Direction", "bEnforceLine", defaults.enforceLine);
 				Config::SetBool("Direction", "bLetterbox", defaults.letterbox);
 				Config::SetInt("Direction", "iLetterboxHeight", defaults.letterboxHeight);
@@ -1908,6 +2099,13 @@ namespace SD::Menu
 				Config::SetBool("Direction", "bFilmScenesAuto", defaults.sceneAuto);
 				Config::SetInt("Direction", "iSceneRange", defaults.sceneRange);
 				Config::SetInt("Direction", "iSceneWait", defaults.sceneWait);
+				Config::SetBool("Direction", "bWatchSign", defaults.watchSign);
+				Config::SetBool("Direction", "bFitShotsToMovement", defaults.fitShotsToMovement);
+				Config::SetBool("Direction", "bTogetherShot", defaults.twoShotHold);
+				Config::SetInt("Direction", "iTogetherChance", defaults.twoShotChance);
+				Config::SetInt("Direction", "iTogetherLines", defaults.twoShotLines);
+				Config::SetInt("Direction", "iTogetherReach", defaults.twoShotReach);
+				Config::SetBool("Sound", "bVoicesUpClose", defaults.voicesUpClose);
 
 				Log::Info(Log::Category::kCore, "Direction dials reset to defaults from the menu."sv);
 			}

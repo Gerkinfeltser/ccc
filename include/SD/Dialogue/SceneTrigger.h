@@ -20,6 +20,12 @@ namespace SD::Dialogue
 		{
 			bool  enabled{ false };
 			float waitSeconds{ 1.5f };  // standing still this long before filming
+
+			// Off: the wait is time spent standing still, so someone already standing
+			// there is filmed on the first line. On: it runs from the moment there is
+			// something to watch, so the sign that shows the wait is always seen
+			// counting.
+			bool fromSighting{ false };
 		};
 
 		struct Input
@@ -43,33 +49,61 @@ namespace SD::Dialogue
 		// True on the frame filming should start.
 		[[nodiscard]] bool Update(const Settings& a_settings, const Input& a_input)
 		{
-			snoozeLeft = std::max(snoozeLeft - std::max(a_input.delta, 0.0f), 0.0f);
+			const float delta = std::max(a_input.delta, 0.0f);
+			snoozeLeft = std::max(snoozeLeft - delta, 0.0f);
+			progress = -1.0f;
 
-			if (!a_settings.enabled || a_input.blocked || !a_input.still) {
+			if (!a_settings.enabled || a_input.blocked) {
 				stillFor = 0.0f;
-				return false;
-			}
-
-			stillFor += std::max(a_input.delta, 0.0f);
-
-			if (!a_input.candidate) {
+				watchedFor = 0.0f;
 				return false;
 			}
 
 			// A scene the player just walked out of stays out until they've left it behind
 			// or some time has passed; otherwise stopping to look back would film it
 			// again.
-			if (snoozeLeft > 0.0f && a_input.key == snoozedKey) {
+			const bool watchable = a_input.candidate && !(snoozeLeft > 0.0f && a_input.key == snoozedKey);
+
+			if (!a_input.still) {
+				stillFor = 0.0f;
+				watchedFor = 0.0f;
+				if (watchable) {
+					progress = 0.0f;  // something to watch, if they stop
+				}
 				return false;
 			}
 
-			if (stillFor < std::max(a_settings.waitSeconds, 0.0f)) {
+			stillFor += delta;
+
+			if (!watchable) {
+				// A candidate comes and goes with the gaps between lines. The wait
+				// only starts over once it has really gone.
+				lostFor += delta;
+				if (lostFor > kLostSeconds) {
+					watchedFor = 0.0f;
+				}
+				return false;
+			}
+			lostFor = 0.0f;
+
+			watchedFor += delta;
+			const float waited = a_settings.fromSighting ? watchedFor : stillFor;
+			const float wait = std::max(a_settings.waitSeconds, 0.0f);
+			if (waited < wait) {
+				progress = waited / wait;
 				return false;
 			}
 
+			progress = 1.0f;
 			stillFor = 0.0f;
+			watchedFor = 0.0f;
 			return true;
 		}
+
+		// How far through the wait the last Update was: 0 when there is something
+		// to watch and the player is still moving, up to 1 on the frame filming
+		// starts. Negative when there is nothing to show.
+		[[nodiscard]] float Progress() const { return progress; }
 
 		// The player ended filming by moving or with the key. That pair stays out of
 		// auto mode for a while; other pairs are unaffected.
@@ -78,11 +112,15 @@ namespace SD::Dialogue
 			snoozedKey = a_key;
 			snoozeLeft = a_seconds;
 			stillFor = 0.0f;
+			watchedFor = 0.0f;
+			progress = -1.0f;
 		}
 
 		void Reset()
 		{
 			stillFor = 0.0f;
+			watchedFor = 0.0f;
+			progress = -1.0f;
 			snoozeLeft = 0.0f;
 			snoozedKey = 0;
 		}
@@ -90,14 +128,23 @@ namespace SD::Dialogue
 		// Filming just stopped, however it started. The player has to stand still
 		// again before auto mode takes the camera; time already spent standing still
 		// doesn't count as a new decision.
-		void Restart() { stillFor = 0.0f; }
+		void Restart()
+		{
+			stillFor = 0.0f;
+			watchedFor = 0.0f;
+			progress = -1.0f;
+		}
 
 		[[nodiscard]] float StillFor() const { return stillFor; }
 
 		static constexpr float kSnoozeSeconds = 25.0f;
+		static constexpr float kLostSeconds = 0.5f;
 
 	private:
 		float         stillFor{ 0.0f };
+		float         watchedFor{ 0.0f };
+		float         lostFor{ 0.0f };
+		float         progress{ -1.0f };
 		float         snoozeLeft{ 0.0f };
 		std::uint64_t snoozedKey{ 0 };
 	};

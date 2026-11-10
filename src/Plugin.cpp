@@ -36,6 +36,10 @@ namespace
 			SD::Runtime::OnGameLoaded();
 			break;
 
+		case SKSE::MessagingInterface::kSaveGame:
+			SD::Runtime::BeforeSave();
+			break;
+
 		default:
 			break;
 		}

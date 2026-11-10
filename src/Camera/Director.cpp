@@ -9,8 +9,11 @@
 #include "SD/Camera/Shot.h"
 #include "SD/Camera/ShotAngles.h"
 #include "SD/Camera/ShotSelection.h"
+#include "SD/Camera/Situational.h"
 #include "SD/Camera/Space.h"
+#include "SD/Camera/Tripod.h"
 #include "SD/Camera/VisibilityRecovery.h"
+#include "SD/Camera/WalkSource.h"
 #include "SD/Compat/DBReV.h"
 #include "SD/Compat/ImprovedCamera.h"
 #include "SD/Compat/SmoothCam.h"
@@ -24,9 +27,11 @@
 #include "SD/Dialogue/Session.h"
 #include "SD/Render/Letterbox.h"
 #include "SD/Runtime.h"
+#include "SD/Scene/CloseMic.h"
 #include "SD/Scene/Focus.h"
 #include "SD/Scene/Interface.h"
 #include "SD/Scene/KeyLight.h"
+#include "SD/Scene/OverlaySignal.h"
 #include "SD/Scene/LightRig.h"
 #include "SD/Scene/FaceGen.h"
 #include "SD/Scene/KeepPosed.h"
@@ -35,8 +40,10 @@
 #include "SD/Scene/Presence.h"
 #include "SD/Scene/StopWork.h"
 #include "SD/Scene/Subtitles.h"
+#include "SD/Scene/WatchCue.h"
 
 #include <chrono>
+#include <numbers>
 
 namespace SD::Camera
 {
@@ -62,6 +69,7 @@ namespace SD::Camera
 		bool              sceneMode{ false };
 		RE::ActorHandle   counterpart{};
 		bool              sceneAutomatic{ false };
+		bool              watchSign{ true };
 		std::uint64_t     sceneKey{ 0 };
 
 		// The game scene being filmed, or 0 when the two NPCs aren't in one.
@@ -270,6 +278,15 @@ namespace SD::Camera
 
 		// Set from requestCut on the tick and kept until the cut gate actually runs.
 		bool forcedCut{ false };
+
+		// Who asked for it, for the cut log. A press of the next-angle key may also cut
+		// between two sizes of the same face, which nothing automatic is allowed to.
+		std::string_view forcedWhy{};
+		bool             cutByKey{ false };
+
+		// In a filmed scene the person on screen left the pair, so the shot needs
+		// replacing. Not a forced cut: it waits a moment after the last one.
+		bool pairCutPending{ false };
 
 		Framing framing{ Framing::kAuto };
 
@@ -564,6 +581,12 @@ namespace SD::Camera
 			float        targetYaw{ 0.0f };
 			float        currentYaw{ 0.0f };
 			bool         freeRotationEnabled{ false };
+
+			// The player's heading, and Presence's turn count, when this was sampled. A
+			// free-look yaw is relative to the body, so after the player has been turned
+			// to face someone it's corrected by the same amount (see RestoreCameraRest).
+			float         playerHeading{ 0.0f };
+			std::uint32_t turnSerial{ 0 };
 		};
 
 		CameraRest cameraRest{};
@@ -903,9 +926,18 @@ namespace SD::Camera
 
 			read.persuasionBeat = Config::Bool("Direction", "bPersuasionBeat", true);
 			read.subtitlesInBar = Config::Bool("Direction", "bSubtitlesInBar", false);
-			read.sceneAuto = Config::Bool("Direction", "bFilmScenesAuto", false);
+			read.sceneAuto = Config::Bool("Direction", "bFilmScenesAuto", true);
 			read.sceneRange = std::clamp(Config::Int("Direction", "iSceneRange", 600), 150, 2000);
 			read.sceneWait = std::clamp(Config::Int("Direction", "iSceneWait", 150), 0, 600);
+			read.watchSign = Config::Bool("Direction", "bWatchSign", true);
+			read.fitShotsToMovement = Config::Bool("Direction", "bFitShotsToMovement", false);
+			read.twoShotHold = Config::Bool("Direction", "bTogetherShot", true);
+			read.twoShotChance = std::clamp(Config::Int("Direction", "iTogetherChance", 35), 0, 100);
+			read.twoShotLines = std::clamp(Config::Int("Direction", "iTogetherLines", 3), 2, 6);
+			read.twoShotReach = std::clamp(Config::Int("Direction", "iTogetherReach", 220), 80, 400);
+			read.turnToFace = Config::Bool("Performance", "bTurnToFace", true);
+			read.voicesUpClose = Config::Bool("Sound", "bVoicesUpClose", true);
+			read.situationalPresets = Config::Bool("Presets", "bSituational", true);
 
 			Director::ApplyTunables(read);
 
@@ -1075,6 +1107,10 @@ namespace SD::Camera
 
 		Anchor playerAnchor{};
 		Anchor npcAnchor{};
+
+		// In a scene, whether the two being filmed stand too far apart for a shoulder
+		// shot (Composable). Updated as the anchors follow them.
+		bool pairFarApart{ false };
 
 		// Measured at conversation open and again on a posture change. Not per frame:
 		// it walks the skeleton, and the result describes the body, not the moment.
@@ -1451,6 +1487,10 @@ namespace SD::Camera
 			cameraRest.targetYaw = state->targetYaw;
 			cameraRest.currentYaw = state->currentYaw;
 			cameraRest.freeRotationEnabled = state->freeRotationEnabled;
+			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+				cameraRest.playerHeading = player->data.angle.z;
+			}
+			cameraRest.turnSerial = Scene::Presence::TurnSerial();
 			cameraRestPrimed = true;
 		}
 
@@ -1508,6 +1548,16 @@ namespace SD::Camera
 			// detached.
 			if (!cameraRest.freeRotationEnabled) {
 				state->freeRotationEnabled = false;
+			}
+
+			// The player was turned to face someone. A free-look yaw is measured from the
+			// body, so the same yaw now would point the view off by the turn; take the turn
+			// out of it and the view ends up where it was before the conversation.
+			auto* turned = RE::PlayerCharacter::GetSingleton();
+			if (turned && state->freeRotationEnabled && cameraRest.turnSerial != Scene::Presence::TurnSerial()) {
+				constexpr float kTwoPi = 2.0f * std::numbers::pi_v<float>;
+				const float     bodyTurn = std::remainder(turned->data.angle.z - cameraRest.playerHeading, kTwoPi);
+				state->freeRotation.x = std::remainder(cameraRest.freeRotation.x - bodyTurn, kTwoPi);
 			}
 
 			state->posOffsetExpected = cameraRest.posOffsetExpected;
@@ -1579,6 +1629,8 @@ namespace SD::Camera
 			if (!ok) {
 				return;
 			}
+
+			Scene::CloseMic::Place(a_pose.position, forward);
 
 			// Match the visibility projection for a shot from directly overhead.
 			const RE::NiPoint3 worldUp = protectSubject && std::abs(forward.z) > 0.999999f ?
@@ -1836,6 +1888,15 @@ namespace SD::Camera
 		void ApplyCue(RE::Actor* a_speaker, std::uint32_t a_words, std::uint16_t a_intensity,
 			std::uint32_t a_emotion, std::string_view a_text);
 
+		// Two NPCs can talk across a room, which a player in conversation never does.
+		// An over-the-shoulder has to stand past the far one, so across that gap it's
+		// a long shot of a distant face behind a shoulder filling half the frame.
+		// Further apart than this there's no shoulder shot, until they're back inside
+		// it by the margin, so someone standing right at the limit can't switch it on
+		// and off.
+		constexpr float kFarShoulder = 300.0f;
+		constexpr float kFarShoulderMargin = 40.0f;
+
 		// Enabled and weighted above zero. Every route to the screen checks this, so a
 		// weight of 0 means never.
 		//
@@ -1844,6 +1905,10 @@ namespace SD::Camera
 		// humanoid (there's no shoulder on a dragon to shoot over). Asked of the
 		// skeleton via Anatomy rather than size, since a giant has shoulders but is
 		// still the wrong thing to shoot over.
+		//
+		// Two NPCs talking across a room is a choice for the pickers, not this (see
+		// Eligible), so a shoulder shot already on screen isn't cut away from the
+		// moment they step apart.
 		[[nodiscard]] bool Composable(ShotType a_type)
 		{
 			if (!OverShoulder(a_type)) {
@@ -1856,6 +1921,13 @@ namespace SD::Camera
 		{
 			return Shot::Enabled(a_type) && Shot::Weight(a_type) > 0 && Composable(a_type);
 		}
+
+		// Defined with the scene code further down.
+		bool Eligible(ShotType a_type);
+		bool Repeats(ShotType a_type);
+		bool OnPairChange(bool a_npcSlot);
+		void OnPostureChange(bool a_npc, bool a_other);
+		void TwoShotOnLine(bool a_turn, bool a_counts);
 
 		// Picks one setup from a pool in proportion to its weight. Templated on the
 		// predicate because it runs inside the picker. Returns nothing when no entry
@@ -1940,7 +2012,7 @@ namespace SD::Camera
 			// switching while it's active.
 			if (FramingIsRoom()) {
 				const auto room = WeightedPick(kEnvironmental, [&](ShotType a_type) {
-					return a_type != currentShot && Drawable(a_type) &&
+					return !Repeats(a_type) && Eligible(a_type) &&
 						!(NeedsRoom(a_type) && !roomy);
 				});
 				return room ? room : Canonical();
@@ -1994,8 +2066,8 @@ namespace SD::Camera
 			// is one, and the weight read here is the slider value.
 			const auto pick = WeightedPick(pool, [&](ShotType a_type) {
 				// Disabled or zero-weight setups must be unreachable. Wide or distant setups
-				// need room.
-				return a_type != currentShot && Drawable(a_type) &&
+				// need room. Faces only when the moment suits them (see FaceReady).
+				return !Repeats(a_type) && Eligible(a_type) &&
 					!(NeedsRoom(a_type) && !roomy);
 			});
 
@@ -2570,7 +2642,13 @@ namespace SD::Camera
 			protectedSearch = {};
 			haveShot = false;  // a new eyeline, and a new room to look across
 			heldSince = {};
-			forcedCut = true;
+
+			// The shot on screen holds where it is; it's replaced soon if it shows the
+			// slot that changed.
+			if (!OnPairChange(a_npcSlot)) {
+				forcedCut = true;
+				forcedWhy = "new pair"sv;
+			}
 		}
 
 		[[nodiscard]] const char* NameOf(RE::Actor* a_actor)
@@ -2736,6 +2814,12 @@ namespace SD::Camera
 			// the room), looks 20 seconds back (banter has long pauses), and accepts about
 			// 65 degrees from the view direction.
 			const auto cast = Dialogue::SceneWatch::Find(std::max(sceneRange, 1000.0f), false, 0.42f, 20.0f);
+			if (!cast && Dialogue::SceneWatch::Deaf()) {
+				Log::Info(Log::Category::kCamera,
+					"Film key: subtitles are off and this game version can't be heard without them."sv);
+				Notify("Turn on subtitles to film other people's conversations.");
+				return;
+			}
 			if (!cast) {
 				Log::Info(Log::Category::kCamera, "Film key: nobody in front of you has spoken lately."sv);
 				Notify("Nobody nearby is talking.");
@@ -2754,8 +2838,10 @@ namespace SD::Camera
 			const bool blocked = SceneBlocked(true);
 			const bool still = !PlayerMoving();
 
+			// With the sign on, the search also runs while the player is moving: the
+			// sign is what tells them there is something to stop for.
 			std::optional<Dialogue::SceneCast> cast{};
-			if (!blocked && still) {
+			if (!blocked && (still || watchSign)) {
 				// Only lines from the last few seconds, in strict mode, and closer to the
 				// center of the view (about 40 degrees). Standing still is a weaker signal
 				// than a key press. See SceneWatch::Find.
@@ -2781,7 +2867,11 @@ namespace SD::Camera
 			const Dialogue::SceneTrigger::Input input{
 				cast.has_value(), cast ? cast->key : 0, still, blocked, std::clamp(a_delta, 0.0f, 0.25f)
 			};
-			if (sceneTrigger.Update(sceneTriggerSettings, input) && cast) {
+			const bool start = sceneTrigger.Update(sceneTriggerSettings, input);
+			if (watchSign && sceneTrigger.Progress() >= 0.0f) {
+				Scene::WatchCue::Show(sceneTrigger.Progress());
+			}
+			if (start && cast) {
 				static_cast<void>(StartScene(*cast, true));
 			}
 		}
@@ -2917,6 +3007,8 @@ namespace SD::Camera
 				++linesSinceCut;
 			}
 			rngState ^= ++cueCount * 0x85EBCA6Bu;
+
+			TwoShotOnLine(turn, worthCutting);
 		}
 
 		// Can this NPC join the filmed scene as its second half?
@@ -2950,7 +3042,10 @@ namespace SD::Camera
 			haveShot = false;
 			sideCommitted = false;
 			heldSince = {};
-			forcedCut = true;
+			if (!OnPairChange(false)) {
+				forcedCut = true;
+				forcedWhy = "someone joined"sv;
+			}
 
 			const char* name = a_other->GetName();
 			Log::Info(Log::Category::kCamera, "Filming: {} joined in; filming the two of them."sv,
@@ -3054,8 +3149,9 @@ namespace SD::Camera
 			return staging && sceneMode ? Beneath::kHud : Beneath::kDialogue;
 		}
 
-		// Who the camera may cut to, kept fully animated (see KeepPosed). The two in
-		// frame, plus the rest of the scene's recent voices in scene mode.
+		// Who the camera may cut to, kept fully animated (see KeepPosed) and heard up
+		// close (see CloseMic). The two in frame, plus the rest of the scene's recent
+		// voices in scene mode.
 		void PublishPosed()
 		{
 			std::array<RE::Actor*, Scene::KeepPosed::kMaxActors> actors{};
@@ -3078,7 +3174,9 @@ namespace SD::Camera
 					}
 				}
 			}
-			Scene::KeepPosed::Set(std::span<RE::Actor* const>{ actors.data(), count });
+			const std::span<RE::Actor* const> filmed{ actors.data(), count };
+			Scene::KeepPosed::Set(filmed);
+			Scene::CloseMic::Update(filmed);
 		}
 
 		// Subtitles in the black bar, every staged frame.
@@ -3189,13 +3287,13 @@ namespace SD::Camera
 			if (sceneMode && !npcSpeaking && cueIntensity >= kCloseUpIntensity &&
 				currentShot != ShotType::kClosePlayer && currentShot != ShotType::kExtremeClosePlayer) {
 				const bool extreme = NextRandom() % 3u == 0u;
-				if (extreme && Drawable(ShotType::kExtremeClosePlayer)) {
+				if (extreme && Eligible(ShotType::kExtremeClosePlayer)) {
 					return ShotType::kExtremeClosePlayer;
 				}
-				if (Drawable(ShotType::kClosePlayer)) {
+				if (Eligible(ShotType::kClosePlayer)) {
 					return ShotType::kClosePlayer;
 				}
-				if (Drawable(ShotType::kExtremeClosePlayer)) {
+				if (Eligible(ShotType::kExtremeClosePlayer)) {
 					return ShotType::kExtremeClosePlayer;
 				}
 			}
@@ -3208,13 +3306,13 @@ namespace SD::Camera
 				// checked against the enable flags; if both are off this falls through to
 				// normal coverage.
 				const bool extreme = NextRandom() % 3u == 0u;
-				if (extreme && Drawable(ShotType::kExtremeClose)) {
+				if (extreme && Eligible(ShotType::kExtremeClose)) {
 					return ShotType::kExtremeClose;
 				}
-				if (Drawable(ShotType::kCloseUp)) {
+				if (Eligible(ShotType::kCloseUp)) {
 					return ShotType::kCloseUp;
 				}
-				if (Drawable(ShotType::kExtremeClose)) {
+				if (Eligible(ShotType::kExtremeClose)) {
 					return ShotType::kExtremeClose;
 				}
 			}
@@ -3437,6 +3535,9 @@ namespace SD::Camera
 			// movie isn't available yet, so calling it here also retries.
 			Scene::Interface::Suppress();
 			Scene::Interface::Enforce();
+			if (sceneMode) {
+				Scene::OverlaySignal::Raise();
+			}
 
 			// A scene has no topic list.
 			if (sceneMode) {
@@ -3582,9 +3683,11 @@ namespace SD::Camera
 			const auto npcNow = PostureOf(speakerPtr.get());
 			const auto playerNow = PostureOf(player);
 			bool       postureChanged = false;
+			const bool npcShifted = npcNow != npcPosture;
+			const bool otherShifted = playerNow != playerPosture;
 			if (!posturePrimed) {
 				posturePrimed = true;
-			} else if (npcNow != npcPosture || playerNow != playerPosture) {
+			} else if (npcShifted || otherShifted) {
 				postureChanged = true;
 				Log::Info(Log::Category::kStaging, "Posture changed ({} -> {}); re-measuring and re-staging."sv,
 					PostureName(npcNow == npcPosture ? playerPosture : npcPosture),
@@ -3592,6 +3695,12 @@ namespace SD::Camera
 			}
 			npcPosture = npcNow;
 			playerPosture = playerNow;
+
+			// In a scene the shot on screen holds through it, and cuts once they've
+			// settled if it was them.
+			if (postureChanged && sceneMode) {
+				OnPostureChange(npcShifted, otherShifted);
+			}
 
 			if (postureChanged) {
 				protectedPose = {};
@@ -3657,6 +3766,17 @@ namespace SD::Camera
 
 			Follow(playerAnchor, *playerTarget, delta);
 			Follow(npcAnchor, *npcTarget, delta);
+			if (sceneMode) {
+				const float gap = std::hypot(npcAnchor.position.x - playerAnchor.position.x,
+					npcAnchor.position.y - playerAnchor.position.y);
+				// Not "far": Windows.h defines it away.
+				const bool apart = gap > (pairFarApart ? kFarShoulder - kFarShoulderMargin : kFarShoulder);
+				if (apart != pairFarApart) {
+					pairFarApart = apart;
+					Log::Info(Log::Category::kContinuity, "{} and {} are {:.0f} units apart; shoulder shots {}."sv,
+						NameOf(speakerPtr.get()), NameOf(player), gap, apart ? "off"sv : "back on"sv);
+				}
+			}
 			TrackFace(npcFaceTrack, speakerPtr.get(), npcBody, *npcTarget, *playerTarget, delta);
 			TrackFace(playerFaceTrack, player, playerBody, *playerTarget, *npcTarget, delta);
 
@@ -3980,6 +4100,8 @@ namespace SD::Camera
 			cueSinceCut = false;
 			turnSinceCut = false;
 			forcedCut = false;
+			cutByKey = false;
+			forcedWhy = {};
 			linesSinceCut = 0;
 			cutEveryTarget = RollCutEvery();
 			return true;
@@ -4050,6 +4172,8 @@ namespace SD::Camera
 				(SecondsSince(protectedRetryAt) >= 0.5f || ordinaryCut || !hadPose)) {
 				StartProtectedSearch(recovery);
 				forcedCut = false;
+				cutByKey = false;
+				forcedWhy = {};
 				cueSinceCut = false;
 				turnSinceCut = false;
 			}
@@ -4157,6 +4281,1110 @@ namespace SD::Camera
 			}
 			fallbackTurn = turnSerial;
 			fallbackCue = cueCount;
+		}
+
+		// ---- Movement in filmed scenes ---------------------------------------------
+		//
+		// Every shot is solved around its subject, so someone who walks drags the
+		// camera along with them. At each cut in a filmed scene both people get a
+		// forecast (Tripod.h, WalkSource.h), and the area they'll move through is
+		// worked out from where they've just been and where they're going. With
+		// [Direction] bFitShotsToMovement on, a shot that wouldn't hold that area as
+		// designed gets a still frame that does: placed at the cut, no closer than the
+		// shot itself, and then neither the camera nor its aim moves. If they leave it
+		// anyway, it cuts. The forecast and the frame it would use are logged with the
+		// setting off.
+
+		bool fitShotsToMovement{ false };
+
+		// Each filmed actor's root: a measured velocity, and a trail of where they've
+		// been over the last few seconds, which is the best guess at the area someone
+		// pacing or fidgeting keeps to.
+		struct Walker
+		{
+			RE::FormID        id{ 0 };
+			RE::NiPoint3      last{};
+			RE::NiPoint3      velocity{};
+			Clock::time_point movingSince{};
+			Clock::time_point stoppedAt{};
+			bool              moving{ false };
+			bool              primed{ false };
+
+			std::array<RE::NiPoint3, 20> trail{};
+			std::size_t                  trailNext{ 0 };
+			std::size_t                  trailCount{ 0 };
+			float                        trailClock{ 0.0f };
+
+			// Seconds of game time since they were first tracked, and the walk their
+			// package has been promising, checked against it.
+			float         clock{ 0.0f };
+			Tripod::Doubt doubt{};
+		};
+		Walker npcWalker{};
+		Walker otherWalker{};
+
+		// How quickly the measured velocity follows the root, per second.
+		constexpr float kWalkerRate = 6.0f;
+
+		// A root that jumps further than this in one frame was moved by the game.
+		constexpr float kWalkerJump = 400.0f;
+
+		// Walking this long mid-shot is a walk, not a step.
+		constexpr float kWalkOnsetSeconds = 0.35f;
+
+		// One trail point every this many seconds; the trail holds the last four.
+		constexpr float kTrailStep = 0.2f;
+
+		// Someone who has left the still frame is cut away from no sooner than this
+		// into the shot, so a cramped room can't strobe.
+		constexpr float kWalkerCutFloor = 1.2f;
+
+		constexpr Tripod::Limits kFrameLimits{};
+
+		// Kept clear inside the frame's edges when a frame is fitted, and when the
+		// shot as designed is checked.
+		constexpr float kFitMargin = 0.06f;
+		constexpr float kDesignMargin = 0.05f;
+
+		// Less spread than this, with nobody forecast to walk, is standing still.
+		constexpr float kStillSpread = 30.0f;
+
+		[[nodiscard]] Tripod::Point ToTripod(const RE::NiPoint3& a_point)
+		{
+			return { a_point.x, a_point.y, a_point.z };
+		}
+
+		[[nodiscard]] RE::NiPoint3 FromTripod(const Tripod::Point& a_point)
+		{
+			return { a_point.x, a_point.y, a_point.z };
+		}
+
+		[[nodiscard]] float FlatDistance(const RE::NiPoint3& a_from, const RE::NiPoint3& a_to)
+		{
+			return Tripod::Flat(ToTripod(a_from), ToTripod(a_to));
+		}
+
+		void Trail(Walker& a_walker, const RE::NiPoint3& a_root)
+		{
+			a_walker.trail[a_walker.trailNext] = a_root;
+			a_walker.trailNext = (a_walker.trailNext + 1) % a_walker.trail.size();
+			a_walker.trailCount = std::min(a_walker.trailCount + 1, a_walker.trail.size());
+		}
+
+		void TrackWalker(Walker& a_walker, RE::Actor* a_actor, float a_delta)
+		{
+			if (!a_actor) {
+				a_walker = {};
+				return;
+			}
+			const auto here = a_actor->GetPosition();
+			if (!a_walker.primed || a_walker.id != a_actor->GetFormID()) {
+				a_walker = {};
+				a_walker.id = a_actor->GetFormID();
+				a_walker.last = here;
+				a_walker.primed = true;
+				Trail(a_walker, here);
+				return;
+			}
+			if (a_delta <= 1.0e-4f) {
+				return;
+			}
+			a_walker.clock += a_delta;
+
+			const RE::NiPoint3 step{ here.x - a_walker.last.x, here.y - a_walker.last.y, here.z - a_walker.last.z };
+			a_walker.last = here;
+			if (step.x * step.x + step.y * step.y > kWalkerJump * kWalkerJump) {
+				a_walker.velocity = {};
+				a_walker.moving = false;
+				a_walker.trailCount = 0;
+				a_walker.trailClock = 0.0f;
+				Trail(a_walker, here);
+				return;
+			}
+
+			a_walker.trailClock += a_delta;
+			if (a_walker.trailClock >= kTrailStep) {
+				a_walker.trailClock = 0.0f;
+				Trail(a_walker, here);
+			}
+
+			const float k = 1.0f - std::exp(-a_delta * kWalkerRate);
+			a_walker.velocity.x += (step.x / a_delta - a_walker.velocity.x) * k;
+			a_walker.velocity.y += (step.y / a_delta - a_walker.velocity.y) * k;
+			a_walker.velocity.z += (step.z / a_delta - a_walker.velocity.z) * k;
+
+			const float speed = std::sqrt(a_walker.velocity.x * a_walker.velocity.x +
+			                              a_walker.velocity.y * a_walker.velocity.y);
+			const bool  moving = speed >= Tripod::kMovingSpeed;
+			if (moving && !a_walker.moving) {
+				a_walker.movingSince = Clock::now();
+			} else if (!moving && a_walker.moving) {
+				a_walker.stoppedAt = Clock::now();
+			}
+			a_walker.moving = moving;
+		}
+
+		void TrackWalkers(float a_delta)
+		{
+			const float delta = std::clamp(a_delta, 0.0f, 0.25f);
+			TrackWalker(npcWalker, subject.get().get(), delta);
+			TrackWalker(otherWalker, OtherParty().get(), delta);
+		}
+
+		[[nodiscard]] bool WalkingFor(const Walker& a_walker, float a_seconds)
+		{
+			return a_walker.moving && SecondsSince(a_walker.movingSince) >= a_seconds;
+		}
+
+		// One person's forecast at a cut, and where they stood, to check it against
+		// where they went.
+		struct Outlook
+		{
+			RE::ActorHandle         who{};
+			RE::NiPoint3            start{};
+			Tripod::Forecast        forecast{};
+			WalkSource::Destination found{};
+			float                   overdue{ -1.0f };  // seconds a walk was forecast and never started
+		};
+
+		[[nodiscard]] Outlook OutlookFor(RE::Actor* a_actor, Walker& a_walker)
+		{
+			Outlook outlook{};
+			if (!a_actor) {
+				return outlook;
+			}
+			outlook.who = a_actor->GetHandle();
+			outlook.start = a_actor->GetPosition();
+
+			const bool       tracked = a_walker.id == a_actor->GetFormID();
+			Tripod::Evidence evidence{};
+			evidence.position = ToTripod(outlook.start);
+			if (tracked) {
+				evidence.velocity = ToTripod(a_walker.velocity);
+			}
+			// The player has no package worth reading, and moving ends filming anyway.
+			if (a_actor != static_cast<RE::Actor*>(RE::PlayerCharacter::GetSingleton())) {
+				outlook.found = WalkSource::Find(a_actor);
+			}
+			if (outlook.found.valid) {
+				evidence.hasDestination = true;
+				evidence.destination = ToTripod(outlook.found.point);
+				evidence.arriveRadius = outlook.found.radius;
+				evidence.destinationSource = outlook.found.source;
+			}
+			outlook.forecast = Tripod::Predict(evidence);
+
+			// A walk the package has promised for a while and they haven't started is
+			// dropped, leaving how they actually move. A scene move queued for a later
+			// phase is meant to wait.
+			const bool promised = outlook.forecast.moving && outlook.forecast.source != Tripod::Source::kVelocity;
+			if (promised && tracked && !outlook.found.later &&
+				!Tripod::Believe(a_walker.doubt, outlook.found.package, evidence.position, a_walker.clock, a_walker.moving)) {
+				outlook.overdue = a_walker.clock - a_walker.doubt.since;
+				evidence.hasDestination = false;
+				outlook.forecast = Tripod::Predict(evidence);
+			}
+			return outlook;
+		}
+
+		[[nodiscard]] std::string Describe(const Outlook& a_outlook)
+		{
+			auto        actor = a_outlook.who.get();
+			const char* name = NameOf(actor.get());
+			const auto& forecast = a_outlook.forecast;
+			const auto& found = a_outlook.found;
+
+			if (!forecast.moving) {
+				if (a_outlook.overdue >= 0.0f) {
+					return fmt::format("{} staying (their {} package {:08X} has pointed {:.0f} units away for {:.1f}s "
+									   "and they haven't moved)",
+						name, found.kind, found.package, Tripod::Flat(ToTripod(a_outlook.start), ToTripod(found.point)),
+						a_outlook.overdue);
+				}
+				if (found.still) {
+					return fmt::format("{} staying (their {} package {:08X} keeps them where they are)", name, found.kind,
+						found.package);
+				}
+				if (found.valid && found.source == Tripod::Source::kScenePackage) {
+					return fmt::format("{} staying (the scene's package {:08X} keeps them here)", name, found.package);
+				}
+				return fmt::format("{} staying", name);
+			}
+
+			std::string line = fmt::format("{} walking {:.0f} units{}, from {}", name, forecast.distance,
+				forecast.reaches ? " to where they're going"sv : ""sv, Tripod::SourceName(forecast.source));
+			if (forecast.source != Tripod::Source::kVelocity && found.valid) {
+				line += fmt::format(" ({:08X} {}, {}", found.package, found.kind, found.how);
+				if (found.target != 0) {
+					line += fmt::format(" {:08X}", found.target);
+				}
+				if (found.source == Tripod::Source::kScenePackage) {
+					line += fmt::format(", scene {:08X} phase {}{}", found.scene, found.phase,
+						found.later ? ", after this line"sv : ""sv);
+				}
+				line += fmt::format(", {:.0f} to go)", forecast.remaining);
+			}
+			return line;
+		}
+
+		// The shot on screen: what was forecast when it started, and how the still
+		// frame fared.
+		struct ShotWatch
+		{
+			Clock::time_point shot{};
+			ShotType          type{ ShotType::kCount };
+			Outlook           npc{};
+			Outlook           other{};
+			bool              valid{ false };
+
+			// No still frame fits, so the shot follows them as before, and movement
+			// starting mid-shot doesn't freeze it either.
+			bool noPlace{ false };
+
+			bool             held{ false };  // a still frame was in use
+			std::string_view lostWhy{};      // and why it gave up, if it did
+		};
+		ShotWatch shotWatch{};
+
+		// Logs how the forecast at the start of the last shot compared with what the
+		// two of them actually did. Only when someone was forecast to walk or did.
+		void ReportShot()
+		{
+			if (!shotWatch.valid) {
+				return;
+			}
+			struct Moved
+			{
+				float distance{ 0.0f };
+				float offBy{ -1.0f };  // degrees between the forecast heading and the real one
+			};
+			const auto moved = [](const Outlook& a_outlook) {
+				Moved result{};
+				auto  actor = a_outlook.who.get();
+				if (!actor) {
+					return result;
+				}
+				const auto now = actor->GetPosition();
+				result.distance = FlatDistance(a_outlook.start, now);
+				const auto& forecast = a_outlook.forecast;
+				if (forecast.moving && result.distance >= 60.0f) {
+					result.offBy = Tripod::Turn(forecast.from, forecast.to, ToTripod(now));
+				}
+				return result;
+			};
+			const auto npc = moved(shotWatch.npc);
+			const auto other = moved(shotWatch.other);
+			if (!shotWatch.npc.forecast.moving && !shotWatch.other.forecast.moving && !shotWatch.held &&
+				npc.distance < Tripod::kMinTravel && other.distance < Tripod::kMinTravel) {
+				return;
+			}
+
+			const auto report = [](const Outlook& a_outlook, const Moved& a_moved) {
+				auto        actor = a_outlook.who.get();
+				std::string line = fmt::format("{} moved {:.0f} (forecast {:.0f}", NameOf(actor.get()), a_moved.distance,
+					a_outlook.forecast.moving ? a_outlook.forecast.distance : 0.0f);
+				if (a_moved.offBy >= 0.0f) {
+					line += fmt::format(", heading off by {:.0f}deg", a_moved.offBy);
+				}
+				return line + ")";
+			};
+			const std::string frame = !shotWatch.held ? std::string{} :
+				shotWatch.lostWhy.empty()             ? std::string{ "; the still frame held them" } :
+				                                        fmt::format("; the still frame lost them ({})", shotWatch.lostWhy);
+			Log::Info(Log::Category::kContinuity, "Walk check, {} ({:.1f}s): {}; {}{}."sv, Name(shotWatch.type),
+				SecondsSince(shotWatch.shot), report(shotWatch.npc, npc), report(shotWatch.other, other), frame);
+		}
+
+		// The still frame on the current shot.
+		struct StillFrame
+		{
+			bool              engaged{ false };
+			RE::NiPoint3      camera{};
+			RE::NiPoint3      aim{};
+			float             lens{ 0.0f };
+			bool              blocked{ false };
+			Clock::time_point blockedSince{};
+			Clock::time_point sightAt{};
+		};
+		StillFrame stillFrame{};
+
+		// Set when someone leaves the still frame; the cut logic takes it.
+		bool walkerLost{ false };
+
+		// Who a shot is of, by slot.
+		[[nodiscard]] bool ShotHasNpc(ShotType a_type)
+		{
+			return IsNeutral(a_type) || FavoursNpc(a_type);
+		}
+
+		[[nodiscard]] bool ShotHasOther(ShotType a_type)
+		{
+			return IsNeutral(a_type) || !FavoursNpc(a_type);
+		}
+
+		// Where someone's eyes are now. The anchors trail a walker on purpose (they're
+		// eased); the frame has to be fitted to where they actually are.
+		[[nodiscard]] std::optional<RE::NiPoint3> HeadNow(RE::Actor* a_actor, const Anatomy& a_body)
+		{
+			return a_actor ? StablePoint(a_actor, a_body) : std::nullopt;
+		}
+
+		// The point the shot is about now: its subject's eyes, or between the two.
+		[[nodiscard]] std::optional<RE::NiPoint3> SubjectNow(ShotType a_type)
+		{
+			auto       first = subject.get();
+			auto       second = OtherParty();
+			const auto npc = ShotHasNpc(a_type) ? HeadNow(first.get(), npcBody) : std::nullopt;
+			const auto other = ShotHasOther(a_type) ? HeadNow(second.get(), playerBody) : std::nullopt;
+			if (npc && other) {
+				return RE::NiPoint3{ (npc->x + other->x) * 0.5f, (npc->y + other->y) * 0.5f, (npc->z + other->z) * 0.5f };
+			}
+			return npc ? npc : other;
+		}
+
+		// Everywhere one person is expected to be over the coming shot, as places for
+		// their eyes: the trail, where they are now, and the forecast walk. The trail
+		// and the forecast are roots, lifted to the eyes by the offset they have now.
+		//
+		// A close-up leaves the trail out. It's where they've been, and someone who
+		// has just stopped walking would push a face shot back across the room.
+		void AddSamples(std::vector<Tripod::Sample>& a_out, RE::Actor* a_actor, const Anatomy& a_body,
+			const Walker& a_walker, const Tripod::Forecast& a_forecast, bool a_faces, bool a_nowOnly,
+			bool a_trail)
+		{
+			const auto head = HeadNow(a_actor, a_body);
+			if (!head) {
+				return;
+			}
+			const auto         root = a_actor->GetPosition();
+			const RE::NiPoint3 lift{ head->x - root.x, head->y - root.y, head->z - root.z };
+			const auto add = [&](float a_x, float a_y, float a_z) {
+				const Tripod::Point at{ a_x + lift.x, a_y + lift.y, a_z + lift.z };
+				a_out.push_back(a_faces ? Tripod::FaceAt(at, a_body.extent) : Tripod::FigureAt(at, a_body.extent));
+			};
+
+			add(root.x, root.y, root.z);
+			if (a_nowOnly) {
+				return;
+			}
+			if (a_trail && a_walker.id == a_actor->GetFormID()) {
+				for (std::size_t i = 0; i < a_walker.trailCount; ++i) {
+					add(a_walker.trail[i].x, a_walker.trail[i].y, a_walker.trail[i].z);
+				}
+			}
+			if (a_forecast.moving) {
+				for (int step = 1; step <= 4; ++step) {
+					const float t = static_cast<float>(step) / 4.0f;
+					add(a_forecast.from.x + (a_forecast.to.x - a_forecast.from.x) * t,
+						a_forecast.from.y + (a_forecast.to.y - a_forecast.from.y) * t,
+						a_forecast.from.z + (a_forecast.to.z - a_forecast.from.z) * t);
+				}
+			}
+		}
+
+		[[nodiscard]] std::vector<Tripod::Sample> Samples(ShotType a_type, bool a_faces, bool a_nowOnly = false)
+		{
+			const bool                  trail = !FollowsFace(a_type);
+			std::vector<Tripod::Sample> samples;
+			if (ShotHasNpc(a_type)) {
+				auto first = subject.get();
+				AddSamples(samples, first.get(), npcBody, npcWalker, shotWatch.npc.forecast, a_faces, a_nowOnly, trail);
+			}
+			if (ShotHasOther(a_type)) {
+				auto second = OtherParty();
+				AddSamples(samples, second.get(), playerBody, otherWalker, shotWatch.other.forecast, a_faces, a_nowOnly, trail);
+			}
+			return samples;
+		}
+
+		// The most ground either person in the shot covers. Taken per person, since
+		// the gap between two people standing still isn't movement.
+		[[nodiscard]] float Wander(ShotType a_type)
+		{
+			const bool                  trail = !FollowsFace(a_type);
+			float                       most = 0.0f;
+			std::vector<Tripod::Sample> one;
+			if (ShotHasNpc(a_type)) {
+				auto first = subject.get();
+				AddSamples(one, first.get(), npcBody, npcWalker, shotWatch.npc.forecast, true, false, trail);
+				most = Tripod::Spread(one);
+			}
+			if (ShotHasOther(a_type)) {
+				one.clear();
+				auto second = OtherParty();
+				AddSamples(one, second.get(), playerBody, otherWalker, shotWatch.other.forecast, true, false, trail);
+				most = std::max(most, Tripod::Spread(one));
+			}
+			return most;
+		}
+
+		[[nodiscard]] Tripod::Lens LensFor(float a_fov, float a_margin)
+		{
+			Tripod::Lens lens{};
+			lens.fovDegrees = a_fov > 1.0f ? a_fov : baseFov;
+			lens.aspect = screenAspect;
+			lens.crop = letterboxWanted ? static_cast<float>(std::clamp(tunables.letterboxHeight, 0, 300)) / 1000.0f : 0.0f;
+			lens.margin = a_margin;
+			return lens;
+		}
+
+		// Nothing stands between the camera and the movement: sight from where they
+		// are now, from the far end of the movement and from its last sample, cast
+		// toward the camera, since a ray that starts inside a wall reports nothing.
+		[[nodiscard]] bool SeesMovement(std::span<const Tripod::Sample> a_samples, const RE::NiPoint3& a_camera)
+		{
+			if (a_samples.empty()) {
+				return false;
+			}
+			const auto& first = a_samples.front();
+			const auto* furthest = &first;
+			for (const auto& sample : a_samples) {
+				if (Tripod::Flat(sample.head, first.head) > Tripod::Flat(furthest->head, first.head)) {
+					furthest = &sample;
+				}
+			}
+			return Clear(FromTripod(first.head), a_camera) && Clear(FromTripod(furthest->head), a_camera) &&
+			       Clear(FromTripod(a_samples.back().head), a_camera);
+		}
+
+		void LockStill(const RE::NiPoint3& a_camera, const RE::NiPoint3& a_aim, float a_lens)
+		{
+			stillFrame = {};
+			stillFrame.engaged = true;
+			stillFrame.camera = a_camera;
+			stillFrame.aim = a_aim;
+			stillFrame.lens = a_lens > 1.0f ? a_lens : baseFov;
+			stillFrame.sightAt = Clock::now();
+			shotWatch.held = true;
+		}
+
+		void DropStill(std::string_view a_why)
+		{
+			if (stillFrame.engaged) {
+				Log::Info(Log::Category::kContinuity, "Still frame: {}; following them again."sv, a_why);
+			}
+			stillFrame = {};
+			walkerLost = false;
+			shotWatch.noPlace = true;
+		}
+
+		// The lowest the camera may stand (just off the floor under them) and the
+		// highest (under the ceiling measured when the conversation staged).
+		void HeightRange(ShotType a_type, float& a_floor, float& a_ceiling)
+		{
+			a_floor = std::numeric_limits<float>::max();
+			if (ShotHasNpc(a_type)) {
+				if (auto first = subject.get()) {
+					a_floor = std::min(a_floor, first->GetPosition().z);
+				}
+			}
+			if (ShotHasOther(a_type)) {
+				if (auto second = OtherParty()) {
+					a_floor = std::min(a_floor, second->GetPosition().z);
+				}
+			}
+			a_floor = a_floor == std::numeric_limits<float>::max() ? -1.0e9f : a_floor + 20.0f;
+
+			a_ceiling = 1.0e9f;
+			if (ceilingRoom > 0.0f) {
+				const float middle = (npcAnchor.position.z + playerAnchor.position.z) * 0.5f;
+				a_ceiling = middle + ceilingRoom - 24.0f;
+			}
+		}
+
+		// The first frame of a shot in a filmed scene: forecast both of them, and if
+		// the shot as designed won't hold where they're about to be, find the still
+		// frame that does.
+		void StartShotWatch(const Pose& a_pose)
+		{
+			ReportShot();
+			stillFrame = {};
+			walkerLost = false;
+
+			shotWatch = {};
+			shotWatch.shot = shotSince;
+			shotWatch.type = currentShot;
+			shotWatch.valid = true;
+			auto first = subject.get();
+			auto second = OtherParty();
+			shotWatch.npc = OutlookFor(first.get(), npcWalker);
+			shotWatch.other = OutlookFor(second.get(), otherWalker);
+
+			const auto faces = Samples(currentShot, true);
+			const float spread = Wander(currentShot);
+			const bool  walking = (ShotHasNpc(currentShot) && shotWatch.npc.forecast.moving) ||
+			                     (ShotHasOther(currentShot) && shotWatch.other.forecast.moving);
+			if (!walking && spread < kStillSpread) {
+				return;  // standing still: the shot as designed, and nothing to log
+			}
+
+			const auto  from = SubjectNow(currentShot);
+			std::string frame{};
+			if (!a_pose.valid || !from) {
+				frame = "the shot didn't place, so there was nothing to start from";
+			} else if (Tripod::FitsAsDesigned(ToTripod(a_pose.position), ToTripod(a_pose.lookAt), ToTripod(*from),
+						   LensFor(a_pose.lens, kDesignMargin), faces, kFrameLimits)) {
+				frame = "the shot as designed already holds it";
+			} else {
+				const auto figures = Samples(currentShot, false);
+				float      floor = 0.0f;
+				float      ceiling = 0.0f;
+				HeightRange(currentShot, floor, ceiling);
+
+				std::array<Tripod::Framing, Tripod::kFramings> framings{};
+				const auto count = Tripod::Frames(ToTripod(a_pose.position), ToTripod(a_pose.lookAt), ToTripod(*from),
+					floor, ceiling, LensFor(a_pose.lens, kFitMargin), figures, kFrameLimits, framings);
+
+				const Tripod::Framing* chosen = nullptr;
+				for (std::size_t i = 0; i < count; ++i) {
+					if (SeesMovement(figures, FromTripod(framings[i].camera))) {
+						chosen = &framings[i];
+						break;
+					}
+				}
+
+				if (chosen) {
+					const float designDistance = Tripod::Distance(ToTripod(a_pose.position), ToTripod(a_pose.lookAt));
+					const float pulled = designDistance > 1.0f ? chosen->distance / designDistance : 1.0f;
+					frame = fmt::format("{} {}{}, {:.0f} units out; they're {:.0f}% of the designed size",
+						fitShotsToMovement ? "holding still"sv : "would hold still"sv,
+						pulled > 1.02f ? fmt::format("{:.1f}x further back", pulled) : std::string{ "at the shot's own distance" },
+						chosen->turn != 0.0f ? fmt::format(", turned {:+.0f}deg", chosen->turn) : std::string{},
+						chosen->distance, chosen->size * 100.0f);
+					if (fitShotsToMovement) {
+						LockStill(FromTripod(chosen->camera), FromTripod(chosen->aim), a_pose.lens);
+					}
+				} else {
+					shotWatch.noPlace = true;
+					frame = count == 0 ? "nothing within reach holds it; following them" :
+					                     "every frame that holds it is blocked; following them";
+				}
+			}
+
+			Log::Info(Log::Category::kContinuity, "Forecast for {} ({}): {}; {}; moving over {:.0f} units. Still frame {}: {}."sv,
+				Name(currentShot), SubjectName(currentShot), Describe(shotWatch.npc), Describe(shotWatch.other), spread,
+				fitShotsToMovement ? "on"sv : "off"sv, frame);
+		}
+
+		// Scene mode, every rendered frame, right after the shot is solved. Starts each
+		// shot's forecast, freezes a shot whose subject starts walking mid-shot, and
+		// while a still frame holds, replaces the solved pose with it and watches for
+		// them leaving it.
+		void DirectWalks(Pose& a_pose)
+		{
+			if (shotWatch.shot != shotSince || !shotWatch.valid) {
+				StartShotWatch(a_pose);
+			}
+
+			if (!fitShotsToMovement) {
+				if (stillFrame.engaged) {
+					DropStill("switched off"sv);
+				}
+				return;
+			}
+
+			if (!stillFrame.engaged) {
+				const bool started = (ShotHasNpc(currentShot) && WalkingFor(npcWalker, kWalkOnsetSeconds)) ||
+				                     (ShotHasOther(currentShot) && WalkingFor(otherWalker, kWalkOnsetSeconds));
+				if (shotWatch.noPlace || walkerLost || !a_pose.valid || !started) {
+					return;
+				}
+				// A close-up can't hold someone walking: their face is out of it in a step,
+				// and a frozen frame would show the empty space for the rest of the shot
+				// floor. It follows them until the cut, which goes wider (FaceReady).
+				if (FollowsFace(currentShot)) {
+					walkerLost = true;
+					shotWatch.lostWhy = "started walking"sv;
+					Log::Info(Log::Category::kContinuity,
+						"Still frame: someone in {} started walking; cutting wider."sv, Name(currentShot));
+					return;
+				}
+				// Nobody forecast this. The frame stops exactly where it is, so taking it
+				// over doesn't show.
+				LockStill(a_pose.position, a_pose.lookAt, a_pose.lens);
+				Log::Info(Log::Category::kContinuity,
+					"Still frame: someone in {} started moving; the camera stops where it is."sv, Name(currentShot));
+			}
+
+			a_pose.position = stillFrame.camera;
+			a_pose.lookAt = stillFrame.aim;
+			a_pose.lens = stillFrame.lens;
+			a_pose.valid = true;
+
+			if (walkerLost) {
+				return;  // already asked for a cut
+			}
+
+			const auto faces = Samples(currentShot, true, true);
+			auto       lost = Tripod::Check(ToTripod(stillFrame.camera), ToTripod(stillFrame.aim),
+				LensFor(stillFrame.lens, 0.0f), faces, kFrameLimits);
+			std::string_view why = Tripod::LostName(lost);
+
+			// Sight, a few times a second rather than every frame.
+			if (lost == Tripod::Lost::kNo && !faces.empty() && SecondsSince(stillFrame.sightAt) >= 0.25f) {
+				stillFrame.sightAt = Clock::now();
+				if (SeesMovement(faces, stillFrame.camera)) {
+					stillFrame.blocked = false;
+				} else if (!stillFrame.blocked) {
+					stillFrame.blocked = true;
+					stillFrame.blockedSince = Clock::now();
+				}
+			}
+			if (lost == Tripod::Lost::kNo && stillFrame.blocked && SecondsSince(stillFrame.blockedSince) >= 0.5f) {
+				lost = Tripod::Lost::kOutOfFrame;
+				why = "went out of sight"sv;
+			}
+
+			if (lost != Tripod::Lost::kNo) {
+				walkerLost = true;
+				shotWatch.lostWhy = why;
+				Log::Info(Log::Category::kContinuity, "Still frame: they {} ({})."sv, why, Name(currentShot));
+			}
+		}
+
+		// ---- Holding the frame ------------------------------------------------------
+		//
+		// In a filmed scene the pair changes with nearly every line, and people sit,
+		// kneel and stand up. Each of those moves the anchors and eyeline every shot is
+		// solved from, so the shot on screen would jump without a cut. Instead it stays
+		// exactly where it is until the next cut. If the change was to someone in it,
+		// that cut comes soon: once the new pair has had a moment, or once they've
+		// finished standing up or sitting down.
+
+		struct ShownPose
+		{
+			Pose              pose{};
+			Clock::time_point shot{};
+			bool              valid{ false };
+		};
+		ShownPose shownPose{};
+
+		struct ShotHold
+		{
+			bool              engaged{ false };
+			Clock::time_point shot{};
+			Pose              pose{};
+			bool              cutWhenSettled{ false };
+			Clock::time_point settleFrom{};
+		};
+		ShotHold shotHold{};
+
+		// A new pair replaces the shot no sooner than this after the last cut, so a
+		// cut and a change of speaker a frame apart aren't two cuts.
+		constexpr float kPairCutFloor = 0.6f;
+
+		// Standing up passes through several postures; the cut waits for the last.
+		constexpr float kPostureSettle = 0.5f;
+
+		bool ShowsSlot(ShotType a_type, bool a_npcSlot)
+		{
+			return IsNeutral(a_type) || OverShoulder(a_type) || FavoursNpc(a_type) == a_npcSlot;
+		}
+
+		bool HoldShot(std::string_view a_why)
+		{
+			if (!sceneMode || !staging || !shownPose.valid || shownPose.shot != shotSince) {
+				return false;
+			}
+			if (!shotHold.engaged || shotHold.shot != shotSince) {
+				shotHold = {};
+				shotHold.engaged = true;
+				shotHold.shot = shotSince;
+				shotHold.pose = shownPose.pose;
+				Log::Info(Log::Category::kContinuity, "Holding {} where it is: {}."sv, Name(currentShot), a_why);
+			}
+			return true;
+		}
+
+		// A slot in the filmed pair changed hands. False when there's nothing on
+		// screen to hold yet, and the caller cuts instead.
+		bool OnPairChange(bool a_npcSlot)
+		{
+			if (!HoldShot("the pair changed"sv)) {
+				return false;
+			}
+			if (ShowsSlot(currentShot, a_npcSlot)) {
+				pairCutPending = true;
+			}
+			return true;
+		}
+
+		// With nothing on screen to hold yet, the anchors just snap.
+		void OnPostureChange(bool a_npc, bool a_other)
+		{
+			if (!HoldShot("someone changed posture"sv)) {
+				return;
+			}
+			if ((a_npc && ShowsSlot(currentShot, true)) || (a_other && ShowsSlot(currentShot, false))) {
+				shotHold.cutWhenSettled = true;
+				shotHold.settleFrom = Clock::now();
+			}
+		}
+
+		// Every rendered frame in scene mode, after the shot is solved. A held shot
+		// replaces the solve, and someone walking out of it asks for a cut.
+		void HoldInPlace(Pose& a_pose)
+		{
+			if (!shotHold.engaged) {
+				return;
+			}
+			if (shotHold.shot != shotSince) {
+				shotHold = {};
+				return;
+			}
+			a_pose = shotHold.pose;
+			if (walkerLost) {
+				return;
+			}
+			// Their eyes leaving the frame, not the face box: an extreme close-up is
+			// tighter than the box, and stands nearer than a still frame may.
+			auto eyes = Samples(currentShot, true, true);
+			for (auto& sample : eyes) {
+				sample.above = 0.0f;
+				sample.below = 0.0f;
+				sample.side = 0.0f;
+			}
+			const auto coverage = Tripod::Cover(ToTripod(a_pose.position), ToTripod(a_pose.lookAt),
+				LensFor(a_pose.lens, 0.0f), eyes);
+			if (!eyes.empty() && (coverage.behind || coverage.worst > 1.0f)) {
+				walkerLost = true;
+				shotWatch.lostWhy = "left the held frame"sv;
+				Log::Info(Log::Category::kContinuity, "Held frame: they left {}."sv, Name(currentShot));
+			}
+		}
+
+		// ---- Choosing faces -----------------------------------------------------
+		//
+		// Who a single is of decides two things the shot type alone can't: whether a
+		// cut stays on the same face (only a new angle will do), and whether this is
+		// the first time the audience sees them.
+
+		RE::FormID        shownPerson{ 0 };
+		Clock::time_point shownPersonShot{};
+
+		std::array<RE::FormID, 24> framedPeople{};
+		std::size_t                framedCount{ 0 };
+
+		// Below this the face is bowed (over a block, a book, a prayer): a close-up
+		// can look up into it, an extreme close-up only finds the top of the head.
+		constexpr float kBowedFace = -0.7f;
+
+		// A walk that ended this recently may carry on.
+		constexpr float kSettleAfterWalk = 1.0f;
+
+		[[nodiscard]] RE::NiPointer<RE::Actor> PersonFor(ShotType a_type)
+		{
+			if (IsNeutral(a_type)) {
+				return {};
+			}
+			return FavoursNpc(a_type) ? subject.get() : OtherParty();
+		}
+
+		[[nodiscard]] bool FramedBefore(RE::FormID a_id)
+		{
+			const auto end = framedPeople.begin() + static_cast<std::ptrdiff_t>(framedCount);
+			return std::find(framedPeople.begin(), end, a_id) != end;
+		}
+
+		void NoteFramed(RE::Actor* a_actor)
+		{
+			if (a_actor && !FramedBefore(a_actor->GetFormID()) && framedCount < framedPeople.size()) {
+				framedPeople[framedCount++] = a_actor->GetFormID();
+			}
+		}
+
+		// On a shot's first rendered frame: who it's of, and who has now been seen.
+		void NoteShown()
+		{
+			if (shownPersonShot == shotSince) {
+				return;
+			}
+			shownPersonShot = shotSince;
+			auto person = PersonFor(currentShot);
+			shownPerson = person ? person->GetFormID() : 0;
+			if (ShowsSlot(currentShot, true)) {
+				NoteFramed(subject.get().get());
+			}
+			if (ShowsSlot(currentShot, false)) {
+				NoteFramed(OtherParty().get());
+			}
+		}
+
+		[[nodiscard]] bool OnTheMove(RE::Actor* a_actor)
+		{
+			if (!sceneMode || !a_actor) {
+				return false;
+			}
+			for (const Walker* walker : { &npcWalker, &otherWalker }) {
+				if (walker->id == a_actor->GetFormID()) {
+					return walker->moving || SecondsSince(walker->stoppedAt) < kSettleAfterWalk;
+				}
+			}
+			return false;
+		}
+
+		[[nodiscard]] bool Extreme(ShotType a_type)
+		{
+			return a_type == ShotType::kExtremeClose || a_type == ShotType::kExtremeClosePlayer;
+		}
+
+		// Whether a close shot of this person works now. Someone walking leaves a
+		// close-up in a step. The extreme close-up is the strongest shot there is,
+		// so it's kept for someone the audience has already seen, with their face up,
+		// saying more than a word or two.
+		[[nodiscard]] bool FaceReady(ShotType a_type)
+		{
+			if (!FollowsFace(a_type)) {
+				return true;
+			}
+			auto person = PersonFor(a_type);
+			if (!person) {
+				return true;
+			}
+			if (OnTheMove(person.get())) {
+				return false;
+			}
+			if (!Extreme(a_type)) {
+				return true;
+			}
+			if (sceneMode && !FramedBefore(person->GetFormID())) {
+				return false;
+			}
+			const bool onNpc = FavoursNpc(a_type);
+			const auto& track = onNpc ? npcFaceTrack : playerFaceTrack;
+			if (track.valid && track.facing.z < kBowedFace) {
+				return false;
+			}
+			// Only the NPC's lines are counted, so outside a scene the player's side has
+			// no word count to judge.
+			const bool speaking = onNpc == npcSpeaking && (sceneMode || onNpc);
+			return !(speaking && lastCueWords > 0 && lastCueWords < 3 && cueIntensity < kCloseUpIntensity);
+		}
+
+		// Same face, nearly the same place, a different size. The next-angle key may;
+		// nothing automatic does.
+		[[nodiscard]] bool JumpCut(ShotType a_type)
+		{
+			if (cutByKey || shownPersonShot != shotSince || shownPerson == 0) {
+				return false;
+			}
+			auto person = PersonFor(a_type);
+			return person && person->GetFormID() == shownPerson && SameAxis(currentShot, a_type);
+		}
+
+		// The shot on screen again. The same setup on someone new in that slot is a
+		// new shot.
+		[[nodiscard]] bool Repeats(ShotType a_type)
+		{
+			if (a_type != currentShot) {
+				return false;
+			}
+			if (IsNeutral(a_type) || shownPersonShot != shotSince) {
+				return true;
+			}
+			auto person = PersonFor(a_type);
+			return !person || person->GetFormID() == shownPerson;
+		}
+
+		// What the pickers may cut to: drawable, and right for this moment. Two NPCs
+		// far apart have no shoulder shot (see kFarShoulder); the shot already on
+		// screen keeps its own until the next cut.
+		bool Eligible(ShotType a_type)
+		{
+			if (!Drawable(a_type)) {
+				return false;
+			}
+			if (sceneMode && pairFarApart && OverShoulder(a_type)) {
+				return false;
+			}
+			return FaceReady(a_type) && !JumpCut(a_type);
+		}
+
+		// ---- Two-shot hold ----------------------------------------------------------
+		//
+		// Two people standing together in a filmed scene now and then get one shot of
+		// both of them, kept up across a couple of lines of their exchange instead of
+		// cutting to whoever speaks. Rolled when the speaker changes. The hold ends on
+		// the line after its last, or earlier if something else needs the cut: someone
+		// leaving the pair, walking out of frame or changing posture, or a key press.
+
+		bool  twoShotEnabled{ true };
+		int   twoShotChance{ 35 };
+		int   twoShotMaxLines{ 3 };
+		float twoShotReach{ 220.0f };
+
+		struct TwoShotHold
+		{
+			bool              wanted{ false };  // rolled; the next cut goes to a two-shot
+			bool              active{ false };
+			Clock::time_point shot{};           // the cut being held
+			int               lines{ 0 };       // lines it has covered, its first included
+			int               target{ 0 };
+			int               turnsSince{ 99 };
+		};
+		TwoShotHold twoShot{};
+
+		// Speaker changes between two holds, so it stays an occasional beat.
+		constexpr int kTwoShotSpacing = 3;
+
+		// A long exchange still lets go at the next line after this.
+		constexpr float kTwoShotLongest = 20.0f;
+
+		// Below this the shot is too compromised to sit on for several lines.
+		constexpr float kTwoShotQuality = 0.55f;
+
+		constexpr std::array kTwoShots{ ShotType::kTwoShot, ShotType::kProfile };
+
+		[[nodiscard]] bool IsTwoShot(ShotType a_type)
+		{
+			return std::find(kTwoShots.begin(), kTwoShots.end(), a_type) != kTwoShots.end();
+		}
+
+		[[nodiscard]] bool TwoShotHolding()
+		{
+			return twoShot.active && twoShot.shot == shotSince;
+		}
+
+		// Why the two being filmed can't share a held shot right now; empty if they can.
+		[[nodiscard]] std::string_view TwoShotRefused()
+		{
+			auto  a = subject.get();
+			auto  b = OtherParty();
+			auto* player = static_cast<RE::Actor*>(RE::PlayerCharacter::GetSingleton());
+			if (!a || !b || b.get() == player) {
+				return "there's nobody else in the scene yet"sv;
+			}
+			if (protectSubject) {
+				return "Keep Subject Visible picks its own shots"sv;
+			}
+			if (framing != Framing::kAuto || ReactionActive()) {
+				return "the framing is held"sv;
+			}
+			if (std::none_of(kTwoShots.begin(), kTwoShots.end(), [](ShotType a_type) { return Drawable(a_type); })) {
+				return "no shot of both of them is enabled"sv;
+			}
+			const auto  pa = a->GetPosition();
+			const auto  pb = b->GetPosition();
+			const float gap = std::hypot(pa.x - pb.x, pa.y - pb.y);
+			if (gap > twoShotReach) {
+				return "they aren't standing together"sv;
+			}
+			if (OnTheMove(a.get()) || OnTheMove(b.get())) {
+				return "one of them is moving"sv;
+			}
+			return {};
+		}
+
+		void StartTwoShotHold(bool a_alreadyUp)
+		{
+			twoShot.wanted = false;
+			twoShot.active = true;
+			twoShot.shot = shotSince;
+			twoShot.lines = 1;
+			const int most = std::clamp(twoShotMaxLines, 2, 6);
+			twoShot.target = 2 + static_cast<int>(NextRandom() % static_cast<std::uint32_t>(most - 1));
+			auto other = OtherParty();
+			Log::Info(Log::Category::kContinuity, "Two-shot: {} and {} together in {}{}; held for {} line(s)."sv,
+				NameOf(subject.get().get()), NameOf(other.get()), Name(currentShot),
+				a_alreadyUp ? " (already on screen)"sv : ""sv, twoShot.target);
+		}
+
+		// Every rendered frame: a hold whose shot was replaced by some other cut is over.
+		void TrackTwoShot()
+		{
+			if (twoShot.active && twoShot.shot != shotSince) {
+				twoShot.active = false;
+				twoShot.turnsSince = 0;
+				Log::Info(Log::Category::kContinuity, "Two-shot: let go after {} of {} line(s) for another cut."sv,
+					twoShot.lines, twoShot.target);
+			}
+		}
+
+		// A line in the filmed scene, from ApplySceneCue. a_counts is false for the
+		// short lines the cadence ignores.
+		void TwoShotOnLine(bool a_turn, bool a_counts)
+		{
+			TrackTwoShot();
+
+			if (twoShot.active) {
+				if (a_counts) {
+					++twoShot.lines;
+				}
+				const bool done = twoShot.lines > twoShot.target || !twoShotEnabled ||
+					SecondsSince(twoShot.shot) >= kTwoShotLongest;
+				if (done) {
+					// This line goes back to the speaker, as a cut of its own.
+					twoShot.active = false;
+					twoShot.turnsSince = 0;
+					forcedCut = true;
+					forcedWhy = "two-shot finished"sv;
+					Log::Info(Log::Category::kContinuity, "Two-shot: held {} for {} line(s) over {:.1f}s; back to the speaker."sv,
+						Name(currentShot), twoShot.lines - 1, SecondsSince(twoShot.shot));
+				}
+				return;
+			}
+
+			// A roll the camera didn't take before the next line lapses with it.
+			twoShot.wanted = false;
+
+			if (a_turn) {
+				++twoShot.turnsSince;
+			}
+			if (!twoShotEnabled || !a_turn || !a_counts || twoShot.turnsSince < kTwoShotSpacing) {
+				return;
+			}
+			if (const auto why = TwoShotRefused(); !why.empty()) {
+				return;
+			}
+			if (NextRandom() % 100u >= static_cast<std::uint32_t>(std::clamp(twoShotChance, 0, 100))) {
+				return;
+			}
+			twoShot.wanted = true;
+		}
+
+		// The shot of both of them for this cut: weighted between the two setups, then
+		// the other if the first places badly. Nothing if neither places well enough
+		// to hold on.
+		[[nodiscard]] std::optional<std::pair<ShotType, float>> PickTwoShot(const Subjects& a_subjects, ScoreCache& a_cache)
+		{
+			const auto usable = [](ShotType a_type) { return Eligible(a_type) && !Repeats(a_type); };
+			const auto first = WeightedPick(std::span<const ShotType>{ kTwoShots }, usable);
+			if (!first) {
+				return std::nullopt;
+			}
+			const auto second = *first == ShotType::kTwoShot ? ShotType::kProfile : ShotType::kTwoShot;
+
+			std::optional<std::pair<ShotType, float>> best{};
+			for (const auto type : { *first, second }) {
+				if (!usable(type)) {
+					continue;
+				}
+				const float quality = Placement(type, a_subjects, a_cache);
+				if (quality >= kTwoShotQuality && (!best || quality > best->second)) {
+					best = std::pair{ type, quality };
+				}
+				if (best && best->second >= kGoodEnough) {
+					break;
+				}
+			}
+			return best;
+		}
+
+		void EndWalks()
+		{
+			ReportShot();
+			shotWatch = {};
+			stillFrame = {};
+			walkerLost = false;
+			npcWalker = {};
+			otherWalker = {};
+			shownPose = {};
+			shotHold = {};
+			pairCutPending = false;
+			shownPerson = 0;
+			shownPersonShot = {};
+			framedCount = 0;
+			twoShot = {};
 		}
 
 	}
@@ -4306,6 +5534,8 @@ namespace SD::Camera
 		// the settings.
 		framing = Framing::kAuto;
 		forcedCut = false;
+		cutByKey = false;
+		forcedWhy = {};
 		requestCut.store(false, std::memory_order_relaxed);
 		requestFraming.store(false, std::memory_order_relaxed);
 
@@ -4371,6 +5601,13 @@ namespace SD::Camera
 
 		playerAnchor = {};
 		npcAnchor = {};
+		pairFarApart = false;
+		shownPose = {};
+		shotHold = {};
+		pairCutPending = false;
+		shownPerson = 0;
+		shownPersonShot = {};
+		framedCount = 0;
 		playerFaceTrack = {};
 		npcFaceTrack = {};
 
@@ -4442,6 +5679,10 @@ namespace SD::Camera
 			Log::Info(Log::Category::kStaging,
 				"Headtracking disabled by ini; the player's animation graph is not touched."sv);
 		}
+		// Turning to face them is its own setting (bTurnToFace, applied live).
+		if (!sceneMode) {
+			Scene::Presence::BeginFacing(a_speaker);
+		}
 		// bHoldPlayerFace is retired: the player's head keeps whatever draw flag the
 		// game gives it.
 		Scene::Performance::HoldPlayerFace(false);
@@ -4449,8 +5690,10 @@ namespace SD::Camera
 		// existing settings.
 		if (!resuming && !a_restaging) {
 			ReadTuning();
+			Situational::Begin(a_speaker, sceneMode);
 		} else {
 			Scene::Performance::Configure(Config::Bool("Performance", "bExpressions", true), false);
+			Situational::Resume();
 		}
 		// The player's face and mouth. NPC pairs keep the engine's own.
 		if (!sceneMode) {
@@ -4463,6 +5706,12 @@ namespace SD::Camera
 		// lines are HUD subtitles, so the HUD hide keeps those.
 		Scene::Interface::SetKeepSubtitles(sceneMode);
 		Scene::Interface::Suppress();
+
+		// Your own conversations have the dialogue menu open, which those overlays
+		// already hide for. See OverlaySignal.h.
+		if (sceneMode) {
+			Scene::OverlaySignal::Raise();
+		}
 
 		// Four lighting settings and a per-angle nudge. See LightRig.h.
 		Scene::KeyLight::Configure(
@@ -4709,8 +5958,23 @@ namespace SD::Camera
 		persuasionBeatEnabled = tunables.persuasionBeat;
 		subtitlesInBar = tunables.subtitlesInBar;
 		sceneTriggerSettings = { tunables.sceneAuto,
-			static_cast<float>(std::clamp(tunables.sceneWait, 0, 600)) / 100.0f };
+			static_cast<float>(std::clamp(tunables.sceneWait, 0, 600)) / 100.0f, tunables.watchSign };
 		sceneRange = static_cast<float>(std::clamp(tunables.sceneRange, 150, 2000));
+		watchSign = tunables.watchSign;
+
+		// Off mid-shot lets go of a still frame on the next frame (DirectWalks).
+		fitShotsToMovement = tunables.fitShotsToMovement;
+
+		// Off mid-hold ends it on the next line, like the hold's own end.
+		twoShotEnabled = tunables.twoShotHold;
+		twoShotChance = std::clamp(tunables.twoShotChance, 0, 100);
+		twoShotMaxLines = std::clamp(tunables.twoShotLines, 2, 6);
+		twoShotReach = static_cast<float>(std::clamp(tunables.twoShotReach, 80, 400));
+
+		Scene::Presence::SetTurnToFace(tunables.turnToFace);
+
+		// Off mid-conversation hands the lines back on the next tick.
+		Scene::CloseMic::SetEnabled(tunables.voicesUpClose);
 
 		// Recorded here and applied on the tick. ApplyTunables runs from the settings
 		// panel on the Present hook, and all Scaleform calls belong to the tick.
@@ -4780,6 +6044,8 @@ namespace SD::Camera
 
 		provisionalStage = false;
 
+		EndWalks();
+
 		// Whoever ended the scene has already logged why.
 		if (sceneMode) {
 			sceneEndedKey = sceneKey;
@@ -4808,10 +6074,13 @@ namespace SD::Camera
 		Scene::FaceGen::End();
 		Scene::LipSync::Release();
 		Scene::KeepPosed::Clear();
+		Scene::CloseMic::Release();
+		Situational::End();
 		spaceReported = -1;
 		Scene::Subtitles::Release();
 		Scene::Interface::Restore();
 		Scene::Interface::SetKeepSubtitles(false);
+		Scene::OverlaySignal::Lower();
 		Scene::KeyLight::Release();
 		Scene::Focus::Release();
 
@@ -5122,8 +6391,9 @@ namespace SD::Camera
 		// first frame.
 		Render::Letterbox::SetBeneath(BarsBeneath());
 
-		// Every subtitled line, whoever says it. Feeds the film key, auto mode and
-		// scene filming. Subtitles carry no emotion, so they count as intensity 50.
+		// Every line someone other than the player says, subtitled or not. Feeds the
+		// film key, auto mode and scene filming. Subtitles carry no emotion, so they
+		// count as intensity 50.
 		for (const auto& line : Dialogue::SceneWatch::Poll()) {
 			if (staging && sceneMode) {
 				if (auto speaker = line.speaker.get()) {
@@ -5153,6 +6423,8 @@ namespace SD::Camera
 					// A framing change is a cut; otherwise the press appears to do nothing until
 					// the shot's minimum hold runs out.
 					forcedCut = true;
+					forcedWhy = "by hand"sv;
+					cutByKey = true;
 
 					// Expires at the end of the turn it was set in. Pressing again in the same
 					// turn cycles the choice and re-arms it.
@@ -5170,6 +6442,8 @@ namespace SD::Camera
 
 				if (wantCut) {
 					forcedCut = true;
+					forcedWhy = "by hand"sv;
+					cutByKey = true;
 				}
 
 				// true180 changed mid-conversation. Only the player's shots move, so cut if
@@ -5179,6 +6453,7 @@ namespace SD::Camera
 					lastPlayerPose = {};
 					if (!FavoursNpc(currentShot)) {
 						forcedCut = true;
+						forcedWhy = "the 180 rule changed"sv;
 						heldSince = {};
 					}
 				}
@@ -5317,6 +6592,11 @@ namespace SD::Camera
 			}
 			frameSubjects = SampleSubjects(a_delta);
 
+			// How the two being filmed are moving, for the walk forecast.
+			if (sceneMode) {
+				TrackWalkers(a_delta);
+			}
+
 			// Player conversation only: the topic list, the player's voice, picks,
 			// gestures, stop-work and the persuasion beat.
 			if (!sceneMode) {
@@ -5402,13 +6682,25 @@ namespace SD::Camera
 		const bool beatHolding = persuasion.Holding();
 		const bool beatDue = persuasion.CutOwed() && npcSpeaking && !sceneMode && framing == Framing::kAuto;
 
-		const bool stale = !beatHolding && timedAllowed && held >= maxShotSeconds;
+		// A two-shot of the pair in a filmed scene holds through their exchange the
+		// same way: no clock, no line count and no coverage. It ends itself on a line
+		// (TwoShotOnLine), and anything that has to move the camera still can.
+		TrackTwoShot();
+		bool twoShotDue = sceneMode && twoShot.wanted && !TwoShotHolding();
+		if (twoShotDue && IsTwoShot(currentShot) && Drawable(currentShot)) {
+			// Already on one; hold it from here.
+			StartTwoShotHold(true);
+			twoShotDue = false;
+		}
+		const bool twoShotHolding = sceneMode && TwoShotHolding();
+
+		const bool stale = !beatHolding && !twoShotHolding && timedAllowed && held >= maxShotSeconds;
 
 		// Per Line Angle Change: hold until this many eligible lines have gone by. A
 		// turn change doesn't count as a reason on its own (otherwise every answer in
 		// a back-and-forth would cut and the cadence setting would do nothing); it
 		// only selects the shorter floor below.
-		const bool motivated = !beatHolding && perLineAngleChange && cueSinceCut &&
+		const bool motivated = !beatHolding && !twoShotHolding && perLineAngleChange && cueSinceCut &&
 			linesSinceCut >= cutEveryTarget;
 
 		// Hold the player through the start of the reply, so the choice has a moment
@@ -5444,22 +6736,35 @@ namespace SD::Camera
 		// A forced framing makes "wrong subject" stricter, otherwise the key would
 		// only affect the next cut and the current angle would stay up for its full
 		// minimum.
-		const bool wrongSubject = wantRoom ?
+		const bool wrongSubject = !twoShotHolding && (wantRoom ?
 			!IsNeutral(currentShot) :
 			(forcedFraming ?
 					(IsNeutral(currentShot) || FavoursNpc(currentShot) != wantNpc) :
 					(neutralStranded ||
-						(!IsNeutral(currentShot) && FavoursNpc(currentShot) != wantNpc)));
+						(!IsNeutral(currentShot) && FavoursNpc(currentShot) != wantNpc))));
 
 		// A key press overrides the hold floor.
 		const bool forceNow = forcedCut || !Drawable(currentShot);
 
-		const float floor = (turnSinceCut || wrongSubject || beatDue) ? minTurnSeconds : minShotSeconds;
+		// Someone left the still frame. Its own short floor rather than the shot
+		// floor: waiting 2.4 s can mean watching them walk out of the picture or
+		// into the lens.
+		const bool walkerCut = sceneMode && walkerLost && held >= kWalkerCutFloor;
+		const auto shotBefore = shotSince;
+
+		// A held shot whose person left the pair, or finished standing up or sitting
+		// down (see HoldShot). Neither waits for the shot floor.
+		const bool pairCut = sceneMode && pairCutPending && held >= kPairCutFloor;
+		const bool settleCut = sceneMode && shotHold.engaged && shotHold.shot == shotSince &&
+			shotHold.cutWhenSettled && SecondsSince(shotHold.settleFrom) >= kPostureSettle && held >= kWalkerCutFloor;
+		const bool heldCut = pairCut || settleCut;
+
+		const float floor = (turnSinceCut || wrongSubject || beatDue || twoShotDue) ? minTurnSeconds : minShotSeconds;
 
 		Pose smartFrame{};
 		if (protectSubject) {
-			const bool ordinaryCut = (motivated || stale || wrongSubject || forceNow || beatDue) &&
-				(held >= floor || forceNow) && (!inPlayerBeat || forceNow) &&
+			const bool ordinaryCut = (motivated || stale || wrongSubject || forceNow || beatDue || walkerCut || heldCut) &&
+				(held >= floor || forceNow || walkerCut || heldCut) && (!inPlayerBeat || forceNow) &&
 				(!HoldingOpenShot() || forceNow);
 			const auto result = ProtectedFrame(subjects, ordinaryCut);
 
@@ -5478,8 +6783,9 @@ namespace SD::Camera
 		}
 
 		// A cut needs both a reason and enough time on the current shot.
-		if (!protectSubject && (motivated || stale || wrongSubject || forceNow || beatDue) &&
-			(held >= floor || forceNow) && (!inPlayerBeat || forceNow)) {
+		const bool cutReason = motivated || stale || wrongSubject || forceNow || beatDue || walkerCut || heldCut;
+		if (!protectSubject && (cutReason || twoShotDue) &&
+			(held >= floor || forceNow || walkerCut || heldCut) && (!inPlayerBeat || forceNow)) {
 			// Chosen only when a cut is actually happening, not every frame.
 			ScoreCache cache{};
 
@@ -5487,9 +6793,26 @@ namespace SD::Camera
 			float    bestQuality = -1.0f;
 			bool     found = false;
 
-			for (int attempt = 0; attempt < 4; ++attempt) {
+			// The rolled two-shot takes this cut if it places well; otherwise the cut
+			// goes ahead as it would have, or doesn't happen if that was its only reason.
+			bool twoShotCut = false;
+			if (twoShotDue) {
+				twoShot.wanted = false;
+				if (const auto pick = PickTwoShot(subjects, cache)) {
+					next = pick->first;
+					bestQuality = pick->second;
+					found = true;
+					twoShotCut = true;
+				} else {
+					Log::Info(Log::Category::kContinuity,
+						"Two-shot: nowhere here frames both of them well enough to hold; cutting as usual."sv);
+				}
+			}
+			const bool usualDraw = !twoShotCut && cutReason;
+
+			for (int attempt = 0; usualDraw && attempt < 4; ++attempt) {
 				const auto choice = Choose();
-				if (!choice || !Drawable(*choice)) {
+				if (!choice || !Eligible(*choice)) {
 					continue;
 				}
 				const auto candidate = *choice;
@@ -5502,7 +6825,7 @@ namespace SD::Camera
 					IsNeutral(candidate) :
 					(FavoursNpc(candidate) == wantNpc || (IsNeutral(candidate) && neutralAllowed));
 
-				if (candidate == currentShot || !correctSubject) {
+				if (Repeats(candidate) || !correctSubject) {
 					continue;
 				}
 
@@ -5523,19 +6846,27 @@ namespace SD::Camera
 			// Nothing in the rotation fits. Try every enabled setup that frames the right
 			// person, tightest first, since tight setups need the least room. Sorted first
 			// so the raycasts go to the candidates most likely to place.
-			if (!found) {
+			if (!found && usualDraw) {
 				std::array<ShotType, static_cast<std::size_t>(ShotType::kCount)> ladder{};
 				std::size_t                                                      count = 0;
 
-				for (std::uint8_t i = 0; i < static_cast<std::uint8_t>(ShotType::kCount); ++i) {
-					const auto candidate = static_cast<ShotType>(i);
-					if (candidate == currentShot || !Drawable(candidate)) {
-						continue;
+				// Shots that suit the moment first. When the shot has to go (a new pair, a
+				// key press, a shot that can't be drawn) and none do, anything drawable.
+				const bool mustGo = forceNow || pairCut || wrongSubject;
+				for (const bool strict : { true, false }) {
+					if (count > 0 || (!strict && !mustGo)) {
+						break;
 					}
-					if (wantRoom ? !IsNeutral(candidate) : FavoursNpc(candidate) != wantNpc) {
-						continue;
+					for (std::uint8_t i = 0; i < static_cast<std::uint8_t>(ShotType::kCount); ++i) {
+						const auto candidate = static_cast<ShotType>(i);
+						if (Repeats(candidate) || !(strict ? Eligible(candidate) : Drawable(candidate))) {
+							continue;
+						}
+						if (wantRoom ? !IsNeutral(candidate) : FavoursNpc(candidate) != wantNpc) {
+							continue;
+						}
+						ladder[count++] = candidate;
 					}
-					ladder[count++] = candidate;
 				}
 
 				std::sort(ladder.begin(), ladder.begin() + static_cast<std::ptrdiff_t>(count),
@@ -5575,8 +6906,17 @@ namespace SD::Camera
 			}
 
 			// The request is spent whether or not a shot was found, so a press can't fire
-			// again later on its own.
+			// again later on its own. If nothing else places, a held shot stays held.
 			forcedCut = false;
+			cutByKey = false;
+			const std::string_view forcedLabel = forcedWhy.empty() ? "shot unavailable"sv : forcedWhy;
+			forcedWhy = {};
+			if (pairCut) {
+				pairCutPending = false;
+			}
+			if (settleCut) {
+				shotHold.cutWhenSettled = false;
+			}
 
 			// Same for the beat: one attempt per answer. It holds on whatever it lands on.
 			const bool beatCut = beatDue && found && Drawable(next) && IsBeatShot(next);
@@ -5597,9 +6937,13 @@ namespace SD::Camera
 					npcSpeaking ? "speaking"sv : "waiting"sv,
 					// Reasons in the same order as the test above, so the log names the one that
 					// actually fired.
-					forceNow    ? "by hand"sv :
+					twoShotCut  ? "two-shot"sv :
+					forceNow    ? forcedLabel :
+						pairCut      ? "new pair"sv :
+						settleCut    ? "they changed posture"sv :
 						beatCut      ? "persuasion"sv :
 						wrongSubject ? "coverage"sv :
+						walkerCut    ? "they moved out of the still frame"sv :
 						motivated    ? "line count"sv :
 						stale        ? "timer"sv :
 									   "unknown"sv,
@@ -5607,6 +6951,11 @@ namespace SD::Camera
 				previousShot = currentShot;
 				currentShot = next;
 				shotSince = Clock::now();
+				pairCutPending = false;
+
+				if (twoShotCut) {
+					StartTwoShotHold(false);
+				}
 
 				// The beat's shot pushes in for the length of the answer and keeps that move
 				// for the rest of the shot.
@@ -5630,6 +6979,12 @@ namespace SD::Camera
 			}
 			cueSinceCut = false;
 			turnSinceCut = false;
+		}
+
+		// Nothing else would place, so the shot stays and goes back to following the
+		// walker rather than watching them leave.
+		if (walkerCut && shotSince == shotBefore) {
+			DropStill("no other setup places here"sv);
 		}
 
 		// The move runs on this shot's own duration, not the staleness ceiling; at the
@@ -5685,6 +7040,14 @@ namespace SD::Camera
 
 		auto pose = protectSubject ? smartFrame : Solve(currentShot, subjects);
 
+		// Before the invalid-pose handling below: a still frame doesn't need the solve
+		// to have placed.
+		NoteShown();
+		if (sceneMode) {
+			DirectWalks(pose);
+			HoldInPlace(pose);
+		}
+
 		if (!pose.valid && !protectSubject) {
 			const auto& remembered = FavoursNpc(currentShot) ? lastNpcPose : lastPlayerPose;
 			if (ReusableShot(remembered.pose.valid, remembered.type, currentShot, Drawable)) {
@@ -5721,11 +7084,15 @@ namespace SD::Camera
 			return;
 		}
 
+		// A held frame may be of someone who has since left the slot, so it isn't
+		// remembered as that slot's last good pose.
 		const bool poseOnNpc = FavoursNpc(currentShot);
-		auto& slot = poseOnNpc ? lastNpcPose : lastPlayerPose;
-		slot.pose = pose;
-		slot.anchor = poseOnNpc ? npcAnchor.position : playerAnchor.position;
-		slot.type = currentShot;
+		if (!shotHold.engaged) {
+			auto& slot = poseOnNpc ? lastNpcPose : lastPlayerPose;
+			slot.pose = pose;
+			slot.anchor = poseOnNpc ? npcAnchor.position : playerAnchor.position;
+			slot.type = currentShot;
+		}
 		if (pose.sweep > kUnheld) {
 			if (heldSweep <= kUnheld && std::abs(pose.sweep) >= 0.05f) {
 				Log::Info(Log::Category::kContinuity, "Placed {}: adjustment {:+.1f}deg."sv,
@@ -5759,6 +7126,7 @@ namespace SD::Camera
 		if (pose.valid && Drawable(currentShot)) {
 			nativeView = false;
 			ApplyPose(root, pose, delta, a_state);
+			shownPose = { pose, shotSince, true };
 
 			// Lens written every frame, because the engine and other mods also write
 			// worldFOV and would revert a value set once. A shot with no lens of its own

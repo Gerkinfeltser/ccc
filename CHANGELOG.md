@@ -1,5 +1,121 @@
 # Changelog
 
+## 1.5.5 — 2026-11-10
+
+New:
+
+- **Show When There Is One To Watch** (Camera > Other People's Conversations,
+  `bWatchSign`, default on). With Film When You Stand Still on, a camera in a
+  ring appears over your head, or at the crosshair in first person, while two
+  people nearby are talking. The ring is empty while you walk and fills as you
+  stand still; filming starts when it closes. With the sign on the wait runs
+  from the moment there is something to watch, so it is always seen counting.
+  Needs SKSE Menu Framework to draw.
+
+- **You Turn To Face Them** (Faces > Body, `[Performance] bTurnToFace`,
+  default on). When a conversation starts you turn to face whoever you're
+  talking to, and again if they end up well off to one side. Not while seated,
+  mounted or using furniture, and left alone if another mod is turning you.
+  A free-look camera is handed back looking where it was before.
+- **Both Of Them In One Shot** (Camera > Other People's Conversations,
+  `bTogetherShot`, default on; `iTogetherChance`, `iTogetherLines`,
+  `iTogetherReach`). Two NPCs talking while standing together sometimes get one
+  shot of both of them, held for a couple of lines of their exchange instead
+  of cutting to each speaker.
+
+- **Voices Up Close** (Screen > Sound, `[Sound] bVoicesUpClose`, default on).
+  Dialogue stays at full volume and in the middle of the screen however far
+  away the camera is. Before, a wide shot made the voice quieter and a reverse
+  shot swapped it to the other ear, because the game hears every line from
+  the camera. The rest of the world is still heard from the camera.
+- **Presets by situation.** A preset file can say when it applies (`when`:
+  indoors or out, a kind of place or a named one, time of day, weather, who
+  you're talking to, their race, faction or keywords, your conversation or
+  one you're filming, a chance), with `unless` for exceptions and `priority`
+  for ties. The one that fits takes over that conversation and your own
+  settings come back afterwards; nothing is written to your ini. Export has
+  **Use It By Itself** choices to make one without editing the file, and
+  installed presets show when they switch on. **Switch Presets By
+  Situation** (`[Presets] bSituational`) turns the rules off.
+- **`use` in preset files** starts from a built-in or installed preset, so a
+  file only has to list what it changes.
+- **Fit Still Shots To Their Movement** (Camera > Other People's
+  Conversations, `bFitShotsToMovement`, default off). In a filmed
+  conversation the camera no longer follows anyone: each shot stands as close
+  as it can while everywhere they're about to move stays in frame, and then
+  neither the camera nor its aim moves. A few steps keep it near; a walk
+  across the room takes it back, or round to an angle the walk fits better.
+  Movement is predicted before it starts, from the last few seconds, the
+  scene's next move for them (including one queued for right after their
+  line), their AI package and how they're already moving. The prediction and
+  the frame it would use are logged with the setting off (`Forecast for …`,
+  `Walk check …`).
+
+Changed:
+
+- **Film When You Stand Still is on by default** (`bFilmScenesAuto`). Stand
+  still near two people talking and their conversation is filmed; moving
+  hands the camera back. A setting you have already saved is kept.
+
+Fixed:
+
+- **Other people's conversations were never filmed with subtitles off.**
+  NPC-to-NPC lines are read from the game's subtitle list, and the game keeps
+  nothing in it while General Subtitles and Dialogue Subtitles are both off,
+  so neither the film key nor Film When You Stand Still had anything to go on.
+  The lines are now caught as the game starts them, whatever the subtitle
+  settings; nothing extra shows on screen. If a game version can't be read
+  this way, the film key says to turn subtitles on instead of "Nobody nearby
+  is talking."
+- **Custom Markers' mini map stayed up in filmed conversations.** Some mods
+  draw their interface themselves rather than as a game menu, so hiding the
+  HUD can't reach it. They hide while a menu is open, which covers your own
+  conversations, but nothing is open while other people talk. Those mods
+  also hide while Photo Mode's `PhotoMode_IsActive` is on (Custom Markers,
+  Skyrim Party Sheet), so it is now raised while other people's
+  conversations are filmed and put back afterwards. Without Photo Mode
+  installed it is made in memory only; nothing goes into a plugin or a save.
+- **Widgets and the compass showing in filmed conversations.** Outside your
+  own conversation the HUD is live, and the game and other mods kept switching
+  pieces of it back on: the compass blinked on at cuts, and widgets came back
+  for up to a quarter of a second at a time. The interface is now held off
+  through both visibility and opacity, re-applied every frame and again right
+  before the HUD draws, and widgets their own mod had switched off are held
+  too, so turning them back on mid-scene shows nothing. Newly opened widget
+  menus are found three times faster.
+- **Filmed conversations stayed wide with Fit Still Shots To Their Movement
+  on.** An NPC talking to another runs a dialogue package whose location is
+  the person they're talking to, and it was read as a walk across the gap
+  between them. Every close-up was then pulled back to hold that walk, two to
+  eight times further out than designed. Conversation packages no longer
+  count as walks, a walk to a person ends in front of them, and a promised
+  walk that hasn't started after a second and a half is dropped until they
+  actually move. The `Forecast` line now names the package's kind.
+- **Over-the-shoulders of two NPCs far apart.** They stood past the far
+  person, so a pair talking across a shop got a long shot. In filmed scenes
+  they're skipped while the two are more than 300 units apart.
+- The forecast no longer counts the distance between two people as movement,
+  so a two-shot of people standing still is never refitted.
+- **Filmed scenes cut far less.** A new speaker in a scene used to force an
+  instant cut every time the pair changed, sometimes a fraction of a second
+  after the last one, and someone sitting, kneeling or standing up jumped the
+  shot on screen even when it was of the other person. Now the shot on screen
+  holds exactly where it is. If it shows someone who just left the pair, it's
+  replaced after a moment; if the person in it changed posture, it cuts once
+  they've settled.
+- **Faces at the right moments.** Automatic cuts no longer jump between the
+  close-up and the extreme close-up of the same face (the next-angle key
+  still can). Nobody gets a close-up while they're walking or have just
+  stopped; a close-up whose subject walks off cuts wider instead of freezing
+  on the empty space. The extreme close-up waits until the person has been
+  seen in a wider shot first, and skips a bowed face and one- or two-word
+  lines.
+- Two NPCs stepping apart no longer cuts away from a shoulder shot already on
+  screen; it just isn't picked again until they're closer.
+- Cuts the log called "by hand" were mostly a change of speaker. The log now
+  names the real reason ("new pair", "they changed posture", "shot
+  unavailable"); "by hand" means a key press.
+
 ## 1.5.0 — 2026-10-03
 
 New:

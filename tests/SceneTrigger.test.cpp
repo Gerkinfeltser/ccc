@@ -74,6 +74,38 @@ int main()
 	Expect(FramesToFire(waiting, on, empty, 30) == -1, "nothing to film, nothing filmed");
 	Expect(FramesToFire(waiting, on, standing) == 1, "a player already standing still is filmed on the first line");
 
+	// With the watch sign on, the wait runs from the sighting instead, so the
+	// same player sees the whole ring fill.
+	const SceneTrigger::Settings sign{ true, 1.5f, true };
+	SceneTrigger sighted;
+	Expect(FramesToFire(sighted, sign, empty, 30) == -1, "nothing to watch, no sign");
+	Expect(sighted.Progress() < 0.0f, "and nothing to show");
+	const int afterSighting = FramesToFire(sighted, sign, standing);
+	Expect(afterSighting >= 15 && afterSighting <= 16, "the wait starts when the conversation does");
+	Expect(sighted.Progress() == 1.0f, "the ring is closed on the frame filming starts");
+
+	// The sign's ring: empty while walking past, part-way while standing.
+	SceneTrigger ring;
+	static_cast<void>(ring.Update(sign, moving));
+	Expect(ring.Progress() == 0.0f, "walking past a conversation shows the empty ring");
+	for (int i = 0; i < 7; ++i) {
+		static_cast<void>(ring.Update(sign, standing));
+	}
+	Expect(ring.Progress() > 0.4f && ring.Progress() < 0.55f, "half the wait is half the ring");
+
+	// A gap between their lines doesn't restart it; losing them for good does.
+	static_cast<void>(ring.Update(sign, empty));
+	static_cast<void>(ring.Update(sign, standing));
+	Expect(ring.Progress() > 0.5f, "a moment without a candidate keeps the ring where it was");
+	for (int i = 0; i < 8; ++i) {
+		static_cast<void>(ring.Update(sign, empty));
+	}
+	static_cast<void>(ring.Update(sign, standing));
+	Expect(ring.Progress() < 0.1f, "after they've gone quiet the ring starts over");
+
+	static_cast<void>(ring.Update(sign, fighting));
+	Expect(ring.Progress() < 0.0f, "no sign while filming is ruled out");
+
 	// The scene the player walked out of is snoozed, others are not.
 	SceneTrigger snoozed;
 	snoozed.Snooze(key);
