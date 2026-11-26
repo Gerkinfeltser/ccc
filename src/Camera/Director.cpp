@@ -44,6 +44,7 @@
 
 #include <chrono>
 #include <numbers>
+#include <cctype>
 
 namespace SD::Camera
 {
@@ -275,6 +276,16 @@ namespace SD::Camera
 		// a frame runs collapse into one.
 		std::atomic<bool> requestCut{ false };
 		std::atomic<bool> requestFraming{ false };
+
+		// From the cue file (Core::Cues): two actors to film, speaker in the high half,
+		// and a shot to cut to (a ShotType, -1 for none).
+		std::atomic<std::uint64_t> requestFilm{ 0 };
+		std::atomic<int>           requestShot{ -1 };
+
+		// The cued shot waiting for its cut. Once on screen it's Shot::Cued, and holds
+		// against CCC's own cuts until the speaker changes (turnSerial moves on).
+		int           cueShotNext{ -1 };
+		std::uint32_t cueHoldTurn{ 0 };
 
 		// Set from requestCut on the tick and kept until the cut gate actually runs.
 		bool forcedCut{ false };
@@ -1919,7 +1930,7 @@ namespace SD::Camera
 
 		[[nodiscard]] bool Drawable(ShotType a_type)
 		{
-			return Shot::Enabled(a_type) && Shot::Weight(a_type) > 0 && Composable(a_type);
+			return (Shot::Cued(a_type) || (Shot::Enabled(a_type) && Shot::Weight(a_type) > 0)) && Composable(a_type);
 		}
 
 		// Defined with the scene code further down.
@@ -2789,6 +2800,33 @@ namespace SD::Camera
 				return false;
 			}
 			return true;
+		}
+
+		// A cue named the two to film: as the film key, but no searching.
+		void FilmPair(RE::FormID a_speaker, RE::FormID a_other)
+		{
+			if (staging) {
+				Log::Info(Log::Category::kCamera, "Film cue ignored: already filming (send stop first)."sv);
+				return;
+			}
+			if (SceneBlocked(false)) {
+				Log::Info(Log::Category::kCamera, "Film cue ignored: not now (combat, a menu, a mount, or the mod is off)."sv);
+				return;
+			}
+			auto* speaker = RE::TESForm::LookupByID<RE::Actor>(a_speaker);
+			auto* other = RE::TESForm::LookupByID<RE::Actor>(a_other);
+			if (!speaker || !other || speaker == other || !speaker->Is3DLoaded() || !other->Is3DLoaded()) {
+				Log::Info(Log::Category::kCamera, "Film cue: {:08X} and {:08X} aren't two people loaded nearby."sv,
+					a_speaker, a_other);
+				return;
+			}
+			Dialogue::SceneCast cast{};
+			cast.speaker = speaker->GetHandle();
+			cast.other = other->GetHandle();
+			cast.exchange = true;
+			cast.how = "named by a cue"sv;
+			cast.key = Dialogue::PairKey(a_speaker, a_other);
+			static_cast<void>(StartScene(cast, false));
 		}
 
 		// The key: film whatever is in front of the player, or stop filming.
@@ -5538,6 +5576,9 @@ namespace SD::Camera
 		forcedWhy = {};
 		requestCut.store(false, std::memory_order_relaxed);
 		requestFraming.store(false, std::memory_order_relaxed);
+		requestShot.store(-1, std::memory_order_relaxed);
+		cueShotNext = -1;
+		Shot::SetCued(std::nullopt);
 
 		// Reset together, or the first override of a new conversation would expire
 		// immediately against a stale serial.
@@ -6415,6 +6456,11 @@ namespace SD::Camera
 			if (requestScene.exchange(false, std::memory_order_relaxed)) {
 				ToggleScene();
 			}
+			// After the film key, so "stop" then "film A B" in one poll switches pairs.
+			if (const auto pair = requestFilm.exchange(0, std::memory_order_relaxed)) {
+				FilmPair(static_cast<RE::FormID>(pair >> 32), static_cast<RE::FormID>(pair));
+			}
+			const int wantShot = requestShot.exchange(-1, std::memory_order_relaxed);
 
 			if (staging) {
 				if (wantFraming) {
@@ -6443,6 +6489,13 @@ namespace SD::Camera
 				if (wantCut) {
 					forcedCut = true;
 					forcedWhy = "by hand"sv;
+					cutByKey = true;
+				}
+
+				if (wantShot >= 0) {
+					cueShotNext = wantShot;
+					forcedCut = true;
+					forcedWhy = "by cue"sv;
 					cutByKey = true;
 				}
 
@@ -6782,9 +6835,12 @@ namespace SD::Camera
 			smartFrame = *result;
 		}
 
+		// A cued shot stays up for its speaker's turn: only another cue or a key moves it.
+		const bool cueHolding = !forceNow && Shot::Cued(currentShot) && turnSerial == cueHoldTurn;
+
 		// A cut needs both a reason and enough time on the current shot.
 		const bool cutReason = motivated || stale || wrongSubject || forceNow || beatDue || walkerCut || heldCut;
-		if (!protectSubject && (cutReason || twoShotDue) &&
+		if (!protectSubject && !cueHolding && (cutReason || twoShotDue) &&
 			(held >= floor || forceNow || walkerCut || heldCut) && (!inPlayerBeat || forceNow)) {
 			// Chosen only when a cut is actually happening, not every frame.
 			ScoreCache cache{};
@@ -6793,11 +6849,43 @@ namespace SD::Camera
 			float    bestQuality = -1.0f;
 			bool     found = false;
 
+			// A shot a cue named. Names repeat across the two sides (Close Up of them, of
+			// you), so it takes the side this moment wants.
+			bool cueCut = false;
+			if (cueShotNext >= 0) {
+				auto want = static_cast<ShotType>(cueShotNext);
+				cueShotNext = -1;
+				if (!IsNeutral(want) && FavoursNpc(want) != wantNpc) {
+					for (std::uint8_t i = 0; i < static_cast<std::uint8_t>(ShotType::kCount); ++i) {
+						const auto mirror = static_cast<ShotType>(i);
+						if (!IsNeutral(mirror) && FavoursNpc(mirror) == wantNpc && Name(mirror) == Name(want)) {
+							want = mirror;
+							break;
+						}
+					}
+				}
+				// Allowed before placing: Placement asks Drawable, which the settings would refuse.
+				Shot::SetCued(want);
+				const float quality = Placement(want, subjects, cache);
+				if (quality >= 0.0f) {
+					next = want;
+					bestQuality = quality;
+					found = true;
+					cueCut = true;
+				} else {
+					Shot::SetCued(std::nullopt);
+					Log::Info(Log::Category::kContinuity,
+						"Shot cue: {} ({}) doesn't place here; cutting as usual."sv, Name(want), SubjectName(want));
+				}
+			}
+
 			// The rolled two-shot takes this cut if it places well; otherwise the cut
 			// goes ahead as it would have, or doesn't happen if that was its only reason.
 			bool twoShotCut = false;
 			if (twoShotDue) {
 				twoShot.wanted = false;
+			}
+			if (twoShotDue && !cueCut) {
 				if (const auto pick = PickTwoShot(subjects, cache)) {
 					next = pick->first;
 					bestQuality = pick->second;
@@ -6808,7 +6896,7 @@ namespace SD::Camera
 						"Two-shot: nowhere here frames both of them well enough to hold; cutting as usual."sv);
 				}
 			}
-			const bool usualDraw = !twoShotCut && cutReason;
+			const bool usualDraw = !twoShotCut && !cueCut && cutReason;
 
 			for (int attempt = 0; usualDraw && attempt < 4; ++attempt) {
 				const auto choice = Choose();
@@ -6952,6 +7040,11 @@ namespace SD::Camera
 				currentShot = next;
 				shotSince = Clock::now();
 				pairCutPending = false;
+				if (cueCut) {
+					cueHoldTurn = turnSerial;
+				} else {
+					Shot::SetCued(std::nullopt);
+				}
 
 				if (twoShotCut) {
 					StartTwoShotHold(false);
@@ -7184,6 +7277,25 @@ namespace SD::Camera
 	void Director::RequestScene() noexcept
 	{
 		requestScene.store(true, std::memory_order_relaxed);
+	}
+
+	void Director::RequestFilm(RE::FormID a_speaker, RE::FormID a_other) noexcept
+	{
+		requestFilm.store((static_cast<std::uint64_t>(a_speaker) << 32) | a_other, std::memory_order_relaxed);
+	}
+
+	bool Director::RequestShot(std::string_view a_name) noexcept
+	{
+		const auto same = [](char a, char b) {
+			return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+		};
+		for (std::uint8_t i = 0; i < static_cast<std::uint8_t>(ShotType::kCount); ++i) {
+			if (std::ranges::equal(Name(static_cast<ShotType>(i)), a_name, same)) {
+				requestShot.store(i, std::memory_order_relaxed);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool Director::FilmingScene() noexcept

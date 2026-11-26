@@ -4,6 +4,7 @@
 #include "SD/Core/Logging.h"
 
 #include <cctype>
+#include <charconv>
 #include <fstream>
 
 namespace SD::Core
@@ -23,8 +24,46 @@ namespace SD::Core
 			auto cmd = a_line.substr(first, a_line.find_last_not_of(" \t") - first + 1);
 			std::ranges::transform(cmd, cmd.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
+			// The rest of the line after the command word, quotes dropped.
+			std::string args;
+			if (const auto space = cmd.find_first_of(" \t"); space != std::string::npos) {
+				args = cmd.substr(cmd.find_first_not_of(" \t", space));
+				cmd.resize(space);
+				std::erase(args, '"');
+			}
+
 			using Camera::Director;
-			if (cmd == "film") {
+			if (cmd == "film" && !args.empty()) {
+				// film <speaker> <other>, as form IDs (0x1A66E or 1A66E).
+				const auto hex = [](std::string_view a_word) -> RE::FormID {
+					if (a_word.starts_with("0x")) {
+						a_word.remove_prefix(2);
+					}
+					RE::FormID id = 0;
+					const auto [end, ec] = std::from_chars(a_word.data(), a_word.data() + a_word.size(), id, 16);
+					return ec == std::errc{} && end == a_word.data() + a_word.size() ? id : 0;
+				};
+				const auto split = args.find_first_of(" \t");
+				const auto a = hex(std::string_view(args).substr(0, split));
+				const auto b = split == std::string::npos ? 0 : hex(std::string_view(args).substr(args.find_first_not_of(" \t", split)));
+				if (!a || !b) {
+					Log::Warn(Log::Category::kCore, "Cue film: '{}' isn't two form IDs (film 0x1A66E 0x813BA)"sv, args);
+					return;
+				}
+				Director::RequestFilm(a, b);
+			} else if (cmd == "shot") {
+				if (!Director::Staging()) {
+					Log::Info(Log::Category::kCore, "Cue shot: nothing being filmed, dropped"sv);
+					return;
+				}
+				if (!Director::RequestShot(args)) {
+					Log::Warn(Log::Category::kCore, "Cue shot: no shot is called '{}' (names as the log's Cut lines print them)"sv, args);
+					return;
+				}
+			} else if (!args.empty()) {
+				Log::Warn(Log::Category::kCore, "Cue not understood: '{} {}'"sv, cmd, args);
+				return;
+			} else if (cmd == "film") {
 				if (Director::FilmingScene()) {
 					Log::Info(Log::Category::kCore, "Cue film: already filming"sv);
 					return;
@@ -43,10 +82,10 @@ namespace SD::Core
 				}
 				cmd == "cut" ? Director::RequestCut() : Director::RequestFraming();
 			} else {
-				Log::Warn(Log::Category::kCore, "Cue not understood: '{}' (film, stop, cut, framing)"sv, cmd);
+				Log::Warn(Log::Category::kCore, "Cue not understood: '{}' (film, stop, cut, framing, shot)"sv, cmd);
 				return;
 			}
-			Log::Info(Log::Category::kCore, "Cue {}"sv, cmd);
+			Log::Info(Log::Category::kCore, "Cue {}{}{}"sv, cmd, args.empty() ? "" : " ", args);
 		}
 	}
 

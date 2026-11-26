@@ -11,6 +11,9 @@ namespace SD::Core
 	//   stop     stop filming it (if filming)
 	//   cut      a new angle now
 	//   framing  next framing: automatic, them, you, the room
+	//   film <speaker> <other>   film these two (form IDs, e.g. film 0x1A66E 0x813BA)
+	//   shot <name>              cut to that shot, named as the log prints it: shot "Close Up"
+	//                            (the side, them or you, follows who the frame is on)
 	class Cues
 	{
 	public:

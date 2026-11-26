@@ -944,6 +944,21 @@ namespace SD::Camera
 			selectionSettings.enabled[index].load(std::memory_order_relaxed);
 	}
 
+	namespace
+	{
+		std::atomic<int> cued{ -1 };
+	}
+
+	void Shot::SetCued(std::optional<ShotType> a_type) noexcept
+	{
+		cued.store(a_type ? static_cast<int>(*a_type) : -1, std::memory_order_relaxed);
+	}
+
+	bool Shot::Cued(ShotType a_type) noexcept
+	{
+		return cued.load(std::memory_order_relaxed) == static_cast<int>(a_type);
+	}
+
 	void Shot::SetWeight(ShotType a_type, int a_weight) noexcept
 	{
 		const auto index = static_cast<std::size_t>(a_type);
@@ -1176,7 +1191,7 @@ namespace SD::Camera
 	Pose Solve(ShotType a_type, const Subjects& a_subjects)
 	{
 		Pose       pose{};
-		if (!Shot::Enabled(a_type) || Shot::Weight(a_type) <= 0) {
+		if (!Shot::Cued(a_type) && (!Shot::Enabled(a_type) || Shot::Weight(a_type) <= 0)) {
 			return pose;
 		}
 		// A carried placement can't reintroduce a wide sweep through the held branch,
