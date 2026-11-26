@@ -322,6 +322,14 @@ namespace SD::Camera
 		// conversation.
 		static void RequestScene() noexcept;
 
+		// From the cue file. Film these two (speaker first), as the film key would
+		// film a pair it found. Ignored while already filming.
+		static void RequestFilm(RE::FormID a_speaker, RE::FormID a_other) noexcept;
+
+		// Cut to the shot with this name, as the log prints it (case ignored), even if
+		// the settings turn it off. False if no shot has that name.
+		static bool RequestShot(std::string_view a_name) noexcept;
+
 		// The camera is filming other people rather than the player's conversation.
 		[[nodiscard]] static bool FilmingScene() noexcept;
 

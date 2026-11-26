@@ -419,6 +419,11 @@ namespace SD::Camera
 		static void               SetEnabled(ShotType a_type, bool a_enabled) noexcept;
 		[[nodiscard]] static bool Enabled(ShotType a_type) noexcept;
 
+		// The shot a cue asked for (Core::Cues), drawn and solved even if the settings
+		// turn it off or weight it 0, until the camera cuts away from it.
+		static void               SetCued(std::optional<ShotType> a_type) noexcept;
+		[[nodiscard]] static bool Cued(ShotType a_type) noexcept;
+
 		// How often this setup is drawn relative to the others in its pool, 0-100.
 		static void              SetWeight(ShotType a_type, int a_weight) noexcept;
 		[[nodiscard]] static int Weight(ShotType a_type) noexcept;
