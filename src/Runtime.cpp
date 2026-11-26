@@ -8,6 +8,7 @@
 #include "SD/Compat/SmoothCam.h"
 #include "SD/Compat/VoiceCommand.h"
 #include "SD/Core/Config.h"
+#include "SD/Core/Cues.h"
 #include "SD/Core/Hotkeys.h"
 #include "SD/Core/Logging.h"
 #include "SD/Core/Tick.h"
@@ -253,6 +254,8 @@ namespace SD::Runtime
 
 		auto& session = Dialogue::Session::GetSingleton();
 		session.OnFrame(a_delta);
+
+		Core::Cues::Poll(a_delta);
 
 		// Release conditions are checked here rather than in the camera hook, so they
 		// still run when the camera state has changed under the staging.
