@@ -282,6 +282,12 @@ namespace SD::Camera
 		std::atomic<std::uint64_t> requestFilm{ 0 };
 		std::atomic<int>           requestShot{ -1 };
 
+		// A line of a script (Core::Cues): speaker in the high half, word count in the
+		// low. Once one arrives the scene follows the script, not what it hears, until
+		// filming stops.
+		std::atomic<std::uint64_t> requestLine{ 0 };
+		bool                       sceneScripted{ false };
+
 		// The cued shot waiting for its cut. Once on screen it's Shot::Cued, and holds
 		// against CCC's own cuts until the speaker changes (turnSerial moves on).
 		int           cueShotNext{ -1 };
@@ -2968,6 +2974,11 @@ namespace SD::Camera
 				return true;
 			}
 
+			// A script says when lines start, and stops filming itself.
+			if (sceneScripted) {
+				return false;
+			}
+
 			// Silence is measured from when the last line actually stopped. A line counts
 			// as running while its estimated length hasn't elapsed, or while either person
 			// has a voice playing or a subtitle up; the sound and subtitle are only
@@ -3103,7 +3114,8 @@ namespace SD::Camera
 
 		void SceneLine(RE::Actor* a_speaker, std::uint32_t a_words, std::uint16_t a_intensity, std::string_view a_text)
 		{
-			if (!a_speaker) {
+			// A script is saying who speaks; hearing the same line again would count it twice.
+			if (!a_speaker || sceneScripted) {
 				return;
 			}
 			const auto id = a_speaker->GetFormID();
@@ -3175,6 +3187,28 @@ namespace SD::Camera
 			}
 
 			ApplySceneCue(fromFirst, a_words, a_intensity);
+		}
+
+		// A cue said this person starts a line of the script now.
+		void ScriptLine(RE::FormID a_speaker, std::uint32_t a_words)
+		{
+			if (!staging || !sceneMode) {
+				Log::Info(Log::Category::kContinuity, "Line cue: nothing being filmed, dropped."sv);
+				return;
+			}
+			const auto first = subject.get();
+			const auto second = counterpart.get();
+			const bool fromFirst = first && first->GetFormID() == a_speaker;
+			if (!fromFirst && !(second && second->GetFormID() == a_speaker)) {
+				Log::Info(Log::Category::kContinuity, "Line cue: {:08X} isn't one of the two being filmed."sv, a_speaker);
+				return;
+			}
+			if (!sceneScripted) {
+				sceneScripted = true;
+				Log::Info(Log::Category::kContinuity,
+					"Scene: following the script's lines; subtitles and silence ignored until filming stops."sv);
+			}
+			ApplySceneCue(fromFirst, a_words, 50);
 		}
 
 		// Which menu the bars go under: the one whose subtitle is in them.
@@ -5577,6 +5611,8 @@ namespace SD::Camera
 		requestCut.store(false, std::memory_order_relaxed);
 		requestFraming.store(false, std::memory_order_relaxed);
 		requestShot.store(-1, std::memory_order_relaxed);
+		requestLine.store(0, std::memory_order_relaxed);
+		sceneScripted = false;
 		cueShotNext = -1;
 		Shot::SetCued(std::nullopt);
 
@@ -6453,12 +6489,18 @@ namespace SD::Camera
 
 			// The film key works staged or not, so it's handled before the branch below.
 			// Starting a scene makes this a staged frame.
+			// Taken first: closing or opening a scene clears the requests.
+			const auto line = requestLine.exchange(0, std::memory_order_relaxed);
 			if (requestScene.exchange(false, std::memory_order_relaxed)) {
 				ToggleScene();
 			}
 			// After the film key, so "stop" then "film A B" in one poll switches pairs.
 			if (const auto pair = requestFilm.exchange(0, std::memory_order_relaxed)) {
 				FilmPair(static_cast<RE::FormID>(pair >> 32), static_cast<RE::FormID>(pair));
+			}
+			// After film, so a script's first line can arrive in the same poll as its film.
+			if (line) {
+				ScriptLine(static_cast<RE::FormID>(line >> 32), static_cast<std::uint32_t>(line));
 			}
 			const int wantShot = requestShot.exchange(-1, std::memory_order_relaxed);
 
@@ -7282,6 +7324,11 @@ namespace SD::Camera
 	void Director::RequestFilm(RE::FormID a_speaker, RE::FormID a_other) noexcept
 	{
 		requestFilm.store((static_cast<std::uint64_t>(a_speaker) << 32) | a_other, std::memory_order_relaxed);
+	}
+
+	void Director::RequestLine(RE::FormID a_speaker, std::uint32_t a_words) noexcept
+	{
+		requestLine.store((static_cast<std::uint64_t>(a_speaker) << 32) | a_words, std::memory_order_relaxed);
 	}
 
 	bool Director::RequestShot(std::string_view a_name) noexcept

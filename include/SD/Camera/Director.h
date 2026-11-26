@@ -326,6 +326,11 @@ namespace SD::Camera
 		// film a pair it found. Ignored while already filming.
 		static void RequestFilm(RE::FormID a_speaker, RE::FormID a_other) noexcept;
 
+		// From the cue file: this one of the two being filmed starts a line of a script
+		// now. From the first, the scene follows these instead of subtitles, and doesn't
+		// end on silence; the script stops it.
+		static void RequestLine(RE::FormID a_speaker, std::uint32_t a_words) noexcept;
+
 		// Cut to the shot with this name, as the log prints it (case ignored), even if
 		// the settings turn it off. False if no shot has that name.
 		static bool RequestShot(std::string_view a_name) noexcept;
