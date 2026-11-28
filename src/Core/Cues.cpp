@@ -6,6 +6,7 @@
 #include <cctype>
 #include <charconv>
 #include <fstream>
+#include <sstream>
 
 namespace SD::Core
 {
@@ -32,20 +33,31 @@ namespace SD::Core
 				std::erase(args, '"');
 			}
 
+			// The first two argument words, and a word as a number (0 if it isn't one).
+			std::string word1, word2;
+			std::istringstream(args) >> word1 >> word2;
+			const auto number = [](std::string_view a_word, int a_base) -> std::uint32_t {
+				if (a_base == 16 && a_word.starts_with("0x")) {
+					a_word.remove_prefix(2);
+				}
+				std::uint32_t value = 0;
+				const auto [end, ec] = std::from_chars(a_word.data(), a_word.data() + a_word.size(), value, a_base);
+				return ec == std::errc{} && end == a_word.data() + a_word.size() ? value : 0;
+			};
+
 			using Camera::Director;
-			if (cmd == "film" && !args.empty()) {
+			if (cmd == "line") {
+				// line <speaker> <words>
+				const auto who = number(word1, 16);
+				if (!who) {
+					Log::Warn(Log::Category::kCore, "Cue line: '{}' doesn't start with a form ID (line 0x1A66E 12)"sv, args);
+					return;
+				}
+				Director::RequestLine(who, number(word2, 10));
+			} else if (cmd == "film" && !args.empty()) {
 				// film <speaker> <other>, as form IDs (0x1A66E or 1A66E).
-				const auto hex = [](std::string_view a_word) -> RE::FormID {
-					if (a_word.starts_with("0x")) {
-						a_word.remove_prefix(2);
-					}
-					RE::FormID id = 0;
-					const auto [end, ec] = std::from_chars(a_word.data(), a_word.data() + a_word.size(), id, 16);
-					return ec == std::errc{} && end == a_word.data() + a_word.size() ? id : 0;
-				};
-				const auto split = args.find_first_of(" \t");
-				const auto a = hex(std::string_view(args).substr(0, split));
-				const auto b = split == std::string::npos ? 0 : hex(std::string_view(args).substr(args.find_first_not_of(" \t", split)));
+				const auto a = number(word1, 16);
+				const auto b = number(word2, 16);
 				if (!a || !b) {
 					Log::Warn(Log::Category::kCore, "Cue film: '{}' isn't two form IDs (film 0x1A66E 0x813BA)"sv, args);
 					return;
@@ -82,7 +94,7 @@ namespace SD::Core
 				}
 				cmd == "cut" ? Director::RequestCut() : Director::RequestFraming();
 			} else {
-				Log::Warn(Log::Category::kCore, "Cue not understood: '{}' (film, stop, cut, framing, shot)"sv, cmd);
+				Log::Warn(Log::Category::kCore, "Cue not understood: '{}' (film, stop, cut, framing, shot, line)"sv, cmd);
 				return;
 			}
 			Log::Info(Log::Category::kCore, "Cue {}{}{}"sv, cmd, args.empty() ? "" : " ", args);
